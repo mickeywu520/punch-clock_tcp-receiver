@@ -1,0 +1,23 @@
+[package]
+name = "punch-clock-tcp-receiver"
+version = "0.1.0"
+edition = "2021"
+description = "SOYAL AR837EF punch clock TCP receiver that parses active-message events and forwards normalized JSON to GCP"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+iced = { version = "0.12", features = ["tokio"] }
+if-addrs = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true

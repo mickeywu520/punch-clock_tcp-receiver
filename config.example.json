@@ -1,0 +1,40 @@
+{
+  "listen": {
+    "bind": "0.0.0.0",
+    "port": 8031,
+    "mode": "text"
+  },
+  "ui": {
+    "enabled": true
+  },
+  "punch_clock": {
+    "ip": "192.168.1.127",
+    "command_port": 1621
+  },
+  "device": {
+    "maker": "SOYAL",
+    "model": "AR837EF"
+  },
+  "receiver_id": "punch-clock-01",
+  "timezone_offset_seconds": 28800,
+  "spool_dir": "./spool",
+  "log_level": "info",
+  "classify": {
+    "enabled": true,
+    "windows": [
+      { "from": "05:00", "to": "12:00", "kind": "check_in" },
+      { "from": "12:00", "to": "23:59", "kind": "check_out" }
+    ]
+  },
+  "gcp": {
+    "endpoint_url": "https://punch-events-xxxxxx.run.app/api/punch-events",
+    "bearer_token": "",
+    "api_key_header": "X-Api-Key",
+    "api_key_value": "",
+    "timeout_secs": 10,
+    "retry_attempts": 5,
+    "batch_enabled": false,
+    "batch_max_items": 100,
+    "batch_flush_interval_secs": 5
+  }
+}

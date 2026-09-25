@@ -1,0 +1,9 @@
+/target
+/spool
+/config.json
+/.env
+*.log
+__pycache__/
+*.pyc
+.idea
+.vscode
