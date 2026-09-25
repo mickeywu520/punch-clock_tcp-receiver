@@ -20,8 +20,7 @@ use forwarder::Delivery;
 use model::GcpPunchEvent;
 use ui::{UiBus, UiEvent};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // wgpu's DX12 backend segfaults (0xC0000005) during adapter enumeration on
     // multi-GPU machines (RTX + AMD + Basic Render Driver). Force the GL
     // backend by default on Windows unless the caller set WGPU_BACKEND.
@@ -41,6 +40,14 @@ async fn main() -> anyhow::Result<()> {
         "punch-clock tcp receiver starting"
     );
 
+    // Award server / delivery tasks onto a dedicated background tokio runtime.
+    // The iced window must run on the *main* thread outside any runtime: iced's
+    // tokio executor builds its own runtime via `Executor::new()`, which panics
+    // if it is called while a runtime is already driving the current thread.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
     // Single shared config: the desktop UI can change fields (punch clock IP,
     // GCP endpoint / API key) and they take effect without a restart.
     let shared = Arc::new(RwLock::new(cfg));
@@ -54,54 +61,63 @@ async fn main() -> anyhow::Result<()> {
         let shared = shared.clone();
         let ui = ui.clone();
         let devices = devices.clone();
-        tokio::spawn(async move { server::run(shared, tx, Some(ui), devices).await })
+        rt.spawn(async move { server::run(shared, tx, Some(ui), devices).await })
     };
 
-    let delivery = Arc::new(Delivery::new(shared.clone(), spool_dir_from(&shared).await).await?);
+    let delivery = Arc::new(
+        rt.block_on(async {
+            Delivery::new(shared.clone(), spool_dir_from(&shared).await).await
+        })?,
+    );
     let delivery_task = {
         let shared = shared.clone();
         let ui = ui.clone();
-        tokio::spawn(run_delivery(delivery, shared, Some(ui), rx))
+        rt.spawn(run_delivery(delivery, shared, Some(ui), rx))
     };
 
-    match ui_enabled_from(&shared).await {
+    match rt.block_on(ui_enabled_from(&shared)) {
         true => {
             info!("starting desktop UI");
-            let initial = ui::InitialSettings {
-                punch_clock_ip: shared.read().await.punch_clock.ip.clone().unwrap_or_default(),
-                command_port: shared.read().await.punch_clock.command_port.to_string(),
-                endpoint: shared.read().await.gcp.endpoint_url.clone().unwrap_or_default(),
-                api_key: shared.read().await.gcp.api_key_value.clone().unwrap_or_default(),
-                status_line: format!(
-                    "就緒。本機監聽 {}:{}，GCP {}。",
-                    shared.read().await.listen.bind,
-                    shared.read().await.listen.port,
-                    if shared.read().await.gcp.endpoint_url.is_some() {
-                        "已設定"
-                    } else {
-                        "未設定"
-                    }
-                ),
-            };
-            let flags = ui::Flags {
-                ui_rx,
-                config: shared.clone(),
-                cfg_path: cfg_path.map(std::path::PathBuf::from),
-                active_devices: devices,
-                listen_addr: listen_addr_from(&shared).await,
-                initial,
-            };
+            let flags = rt.block_on(async {
+                let g = shared.read().await;
+                ui::Flags {
+                    ui_rx,
+                    config: shared.clone(),
+                    cfg_path: cfg_path.map(std::path::PathBuf::from),
+                    active_devices: devices,
+                    listen_addr: format!("{}:{}", g.listen.bind, g.listen.port),
+                    initial: ui::InitialSettings {
+                        punch_clock_ip: g.punch_clock.ip.clone().unwrap_or_default(),
+                        command_port: g.punch_clock.command_port.to_string(),
+                        endpoint: g.gcp.endpoint_url.clone().unwrap_or_default(),
+                        api_key: g.gcp.api_key_value.clone().unwrap_or_default(),
+                        status_line: format!(
+                            "就緒。本機監聽 {}:{}，GCP {}。",
+                            g.listen.bind,
+                            g.listen.port,
+                            if g.gcp.endpoint_url.is_some() {
+                                "已設定"
+                            } else {
+                                "未設定"
+                            }
+                        ),
+                    },
+                    ..Default::default()
+                }
+            });
             ui::run(flags)?;
         }
         false => {
-            shutdown_signal().await;
+            rt.block_on(shutdown_signal());
         }
     }
 
     info!("shutting down");
-    server_task.abort();
-    let _ = server_task.await;
-    let _ = delivery_task.await;
+    rt.block_on(async {
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = delivery_task.await;
+    });
     info!("shutdown complete");
     Ok(())
 }

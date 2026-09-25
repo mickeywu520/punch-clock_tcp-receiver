@@ -4,6 +4,10 @@
 //! punch clock backend), lets the operator set the punch clock IP and the GCP
 //! endpoint / API key, tests the punch clock connectivity, and shows live
 //! events / forwarding status fed from the tokio runtime via channels.
+//!
+//! Iced 0.13+ loads the OS font set at startup (cosmic-text calls
+//! `fontdb::load_system_fonts`), so Chinese text renders out of the box; we
+//! only pin the default font to the Traditional-Chinese face on Windows.
 
 use std::collections::HashMap;
 use std::net::TcpStream;
@@ -12,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{button, column, row, text, text_input};
-use iced::{Alignment, Application, Command, Element, Length, Settings, Subscription, Theme, Size};
+use iced::{Alignment, Element, Font, Length, Size, Subscription, Task, Theme};
 
 use crate::config::Config;
 
@@ -144,36 +148,45 @@ struct App {
 }
 
 pub fn run(flags: Flags) -> iced::Result {
-    let settings = Settings {
-        flags,
-        window: iced::window::Settings {
-            size: Size::new(780.0, 700.0),
-            resizable: true,
-            ..Default::default()
-        },
-        ..Default::default()
+    let boot = {
+        let flags = Arc::new(Mutex::new(Some(flags)));
+        move || {
+            let flags = flags
+                .lock()
+                .map(|mut f| f.take())
+                .ok()
+                .flatten()
+                .expect("boot flags consumed once");
+            (App::new(flags), Task::none())
+        }
     };
-    App::run(settings)
+    iced::application(boot, App::update, App::view)
+        .title("打卡機中轉程式 (Punch Clock Receiver)")
+        .subscription(App::subscription)
+        .theme(Theme::Dark)
+        .default_font(default_font())
+        .window_size(Size::new(780.0, 700.0))
+        .resizable(true)
+        .run()
 }
 
-impl App {
-    fn drain_events(&mut self) {
-        let events: Vec<UiEvent> = self.rx.try_iter().collect();
-        for ev in events {
-            let _ = self.update(Message::Ui(ev));
-        }
+/// The Traditional-Chinese font bundled with Windows. System fonts are loaded
+/// automatically by iced 0.14, so this family always resolves on Windows.
+fn default_font() -> Font {
+    #[cfg(target_os = "windows")]
+    {
+        Font::with_name("Microsoft JhengHei")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Font::DEFAULT
     }
 }
 
-impl Application for App {
-    type Executor = iced::executor::Default;
-    type Message = Message;
-    type Theme = Theme;
-    type Flags = Flags;
-
-    fn new(flags: Self::Flags) -> (Self, Command<Message>) {
+impl App {
+    fn new(flags: Flags) -> Self {
         let local_ips = local_ipv4();
-        let app = App {
+        App {
             external: flags.config,
             cfg_path: flags.cfg_path,
             rx: flags.ui_rx,
@@ -188,20 +201,21 @@ impl Application for App {
             test_status: None,
             last_events: Vec::new(),
             gcp_status: None,
-        };
-        (app, Command::none())
+        }
     }
 
-    fn title(&self) -> String {
-        "打卡機中轉程式 (Punch Clock Receiver)".to_string()
+    fn drain_events(&mut self) -> Task<Message> {
+        let events: Vec<UiEvent> = self.rx.try_iter().collect();
+        let mut task = Task::none();
+        for ev in events {
+            task = task.chain(self.update(Message::Ui(ev)));
+        }
+        task
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => {
-                self.drain_events();
-                Command::none()
-            }
+            Message::Tick => self.drain_events(),
             Message::Ui(ev) => {
                 match ev {
                     UiEvent::DeviceConnected(ip) => {
@@ -211,10 +225,7 @@ impl Application for App {
                         self.status_line = format!("卡鐘離線：{ip}");
                     }
                     UiEvent::Punch { time, uid, event, ip } => {
-                        self.last_events.insert(
-                            0,
-                            (time, uid, event, ip),
-                        );
+                        self.last_events.insert(0, (time, uid, event, ip));
                         self.last_events.truncate(200);
                     }
                     UiEvent::GcpStatus { ok, count, detail } => {
@@ -227,23 +238,23 @@ impl Application for App {
                         self.status_line = format!("錯誤：{e}");
                     }
                 }
-                Command::none()
+                Task::none()
             }
             Message::EditPunchClockIp(s) => {
                 self.edit_punch_clock_ip = s;
-                Command::none()
+                Task::none()
             }
             Message::EditPort(s) => {
                 self.edit_port = s;
-                Command::none()
+                Task::none()
             }
             Message::EditEndpoint(s) => {
                 self.edit_endpoint = s;
-                Command::none()
+                Task::none()
             }
             Message::EditApiKey(s) => {
                 self.edit_api_key = s;
-                Command::none()
+                Task::none()
             }
             Message::Save => {
                 let cfg_path = self.cfg_path.clone();
@@ -252,7 +263,7 @@ impl Application for App {
                 let port = self.edit_port.trim().to_string();
                 let endpoint = self.edit_endpoint.trim().to_string();
                 let api_key = self.edit_api_key.trim().to_string();
-                Command::perform(
+                Task::perform(
                     async move {
                         save_config(external, cfg_path, punch_ip, port, endpoint, api_key).await
                     },
@@ -264,7 +275,7 @@ impl Application for App {
                     Ok(()) => "已儲存，立即生效。".to_string(),
                     Err(e) => format!("儲存失敗：{e}"),
                 };
-                Command::none()
+                Task::none()
             }
             Message::TestConnect => {
                 let ip = self.edit_punch_clock_ip.trim().to_string();
@@ -273,7 +284,7 @@ impl Application for App {
                     .trim()
                     .parse::<u16>()
                     .unwrap_or(1621);
-                Command::perform(
+                Task::perform(
                     async move { test_tcp(ip, port).await },
                     Message::TestResult,
                 )
@@ -283,7 +294,7 @@ impl Application for App {
                     Ok(m) => m,
                     Err(e) => e,
                 });
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -293,12 +304,10 @@ impl Application for App {
     }
 
     fn view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
-        let local_ips = self
-            .local_ips
-            .iter()
-            .fold(column![].push(text("本機 IPv4（填入卡鐘後台 Message Server IP 1st）：").size(16)), |col, ip| {
-                col.push(text(ip.clone()).size(28))
-            });
+        let local_ips = self.local_ips.iter().fold(
+            column![].push(text("本機 IPv4（填入卡鐘後台 Message Server IP 1st）：").size(16)),
+            |col, ip| col.push(text(ip.clone()).size(28)),
+        );
 
         let connected = {
             let set = self
@@ -348,8 +357,7 @@ impl Application for App {
             .spacing(8),
             row![
                 text("API Key   "),
-                text_input("X-Api-Key 的值", &self.edit_api_key)
-                    .on_input(Message::EditApiKey),
+                text_input("X-Api-Key 的值", &self.edit_api_key).on_input(Message::EditApiKey),
             ]
             .spacing(8),
             button("儲存設定（寫入 config.json）").on_press(Message::Save),
@@ -391,7 +399,7 @@ impl Application for App {
                 .width(Length::Fill),
                 settings.width(Length::Shrink),
             ]
-            .align_items(Alignment::Start)
+            .align_y(Alignment::Start)
             .spacing(24),
             local_ips,
             status,
@@ -404,7 +412,7 @@ impl Application for App {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers used by async Commands
+// Helpers used by async Tasks
 // ---------------------------------------------------------------------------
 
 async fn save_config(
@@ -457,7 +465,72 @@ async fn test_tcp(ip: String, port: u16) -> Result<String, String> {
             .map_err(|e| e.to_string())?,
         Duration::from_secs(3),
     ) {
-        Ok(_) => Ok(format!("✅ {addr} 連線成功（卡鐘應已連上網路後台）")),
-        Err(e) => Err(format!("❌ {addr} 連線失敗：{e}")),
+        Ok(_) => Ok(format!("{addr} 連線成功（卡鐘應已連上網路後台）")),
+        Err(e) => Err(format!("{addr} 連線失敗：{e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CJK font regression guard
+// ---------------------------------------------------------------------------
+//
+// iced 0.14 renders text through cosmic-text, which loads the OS font set on
+// startup. This test pins down, on this machine, that:
+//   1. the system font set is actually loaded (Microsoft JhengHei appears), and
+//   2. that face covers every CJK character used anywhere in the UI.
+// If a future upgrade regresses the font loading, this test fails.
+
+#[cfg(all(test, target_os = "windows"))]
+mod ui_font_tests {
+    use iced_graphics::text::cosmic_text::{self, fontdb};
+
+    const CJK_SAMPLE: &str =
+        "打卡機中轉程式等待卡鐘連線轉拋儲存設定已連線離線最近刷卡命令埠測試錯誤GCP送達成功尚無本機位址填入後台";
+
+    fn face_covers_all(face: &ttf_parser::Face) -> bool {
+        CJK_SAMPLE.chars().all(|c| face.glyph_index(c).is_some())
+    }
+
+    #[test]
+    fn system_fonts_loaded_and_cover_ui_text() {
+        let font_system = cosmic_text::FontSystem::new();
+        let (_locale, db) = font_system.into_locale_and_db();
+
+        let sample = std::fs::read_to_string("C:\\Windows\\Fonts\\msjh.ttc").unwrap_or_default();
+        if db.faces().next().is_none() && sample.is_empty() {
+            panic!("no system fonts loaded and msjh.ttc missing - system fonts not loaded");
+        }
+
+        let jhenghei: Vec<_> = db
+            .faces()
+            .filter(|f| {
+                f.families
+                    .iter()
+                    .any(|(name, _)| name == "Microsoft JhengHei")
+            })
+            .map(|f| f.id)
+            .collect();
+
+        assert!(
+            !jhenghei.is_empty(),
+            "system font set did not load 'Microsoft JhengHei' (fonts ignored?)"
+        );
+
+        for id in jhenghei {
+            if db
+                .with_face_data(id, |data, index| {
+                    ttf_parser::Face::parse(data, index)
+                        .map(|face| face_covers_all(&face))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+            {
+                return;
+            }
+        }
+
+        panic!(
+            "no 'Microsoft JhengHei' face covers all CJK chars: {CJK_SAMPLE}"
+        );
     }
 }
