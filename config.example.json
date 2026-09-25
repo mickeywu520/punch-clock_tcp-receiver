@@ -11,6 +11,13 @@
     "ip": "192.168.1.127",
     "command_port": 1621
   },
+  "clock_sync": {
+    "enabled": true,
+    "interval_secs": 300,
+    "max_drift_secs": 60,
+    "reconnect_secs": 5,
+    "bcd_encoding": false
+  },
   "device": {
     "maker": "SOYAL",
     "model": "AR837EF"

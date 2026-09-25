@@ -39,6 +39,12 @@ pub enum UiEvent {
         count: usize,
         detail: String,
     },
+    /// 卡鐘 RTC 輪詢狀態（由 ua worker 送出）
+    ClockStatus {
+        online: bool,
+        rtc: Option<String>,
+        note: Option<String>,
+    },
     Info(String),
     Error(String),
 }
@@ -98,11 +104,14 @@ pub struct Flags {
     pub active_devices: Arc<Mutex<HashMap<String, u32>>>,
     pub listen_addr: String,
     pub initial: InitialSettings,
+    /// 卡鐘校時 worker 的指令端（GUI「卡鐘校時」按鈕使用）
+    pub clock_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::ua::ClockSyncCmd>,
 }
 
 impl Default for Flags {
     fn default() -> Self {
         let (_tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             ui_rx: rx,
             config: Arc::new(tokio::sync::RwLock::new(Config::default())),
@@ -110,6 +119,7 @@ impl Default for Flags {
             active_devices: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
             initial: InitialSettings::default(),
+            clock_sync_tx: sync_tx,
         }
     }
 }
@@ -126,6 +136,7 @@ pub enum Message {
     SaveResult(Result<(), String>),
     TestConnect,
     TestResult(Result<String, String>),
+    ClockSyncNow,
 }
 
 struct App {
@@ -133,7 +144,9 @@ struct App {
     cfg_path: Option<PathBuf>,
     rx: std::sync::mpsc::Receiver<UiEvent>,
     active_devices: Arc<Mutex<HashMap<String, u32>>>,
+    clock_sync_tx: tokio::sync::mpsc::UnboundedSender<crate::ua::ClockSyncCmd>,
     listen_addr: String,
+    clock_ip: String,
 
     local_ips: Vec<String>,
     edit_punch_clock_ip: String,
@@ -145,6 +158,8 @@ struct App {
     test_status: Option<String>,
     last_events: Vec<(String, String, String, String)>, // time, uid, event, ip
     gcp_status: Option<(bool, String)>,
+    clock_online: bool,
+    clock_rtc: String,
 }
 
 pub fn run(flags: Flags) -> iced::Result {
@@ -191,7 +206,9 @@ impl App {
             cfg_path: flags.cfg_path,
             rx: flags.ui_rx,
             active_devices: flags.active_devices,
+            clock_sync_tx: flags.clock_sync_tx,
             listen_addr: flags.listen_addr,
+            clock_ip: flags.initial.punch_clock_ip.clone(),
             local_ips,
             edit_punch_clock_ip: flags.initial.punch_clock_ip,
             edit_port: flags.initial.command_port,
@@ -201,6 +218,8 @@ impl App {
             test_status: None,
             last_events: Vec::new(),
             gcp_status: None,
+            clock_online: false,
+            clock_rtc: "－".to_string(),
         }
     }
 
@@ -231,6 +250,15 @@ impl App {
                     UiEvent::GcpStatus { ok, count, detail } => {
                         self.gcp_status = Some((ok, format!("{count} 筆 {detail}")));
                     }
+                    UiEvent::ClockStatus { online, rtc, note } => {
+                        self.clock_online = online;
+                        if let Some(r) = rtc {
+                            self.clock_rtc = r;
+                        }
+                        if let Some(n) = note {
+                            self.status_line = format!("卡鐘：{n}");
+                        }
+                    }
                     UiEvent::Info(s) => {
                         self.status_line = s;
                     }
@@ -238,6 +266,11 @@ impl App {
                         self.status_line = format!("錯誤：{e}");
                     }
                 }
+                Task::none()
+            }
+            Message::ClockSyncNow => {
+                let _ = self.clock_sync_tx.send(crate::ua::ClockSyncCmd::SyncNow);
+                self.status_line = "已送出校時指令，等待卡鐘回應…".to_string();
                 Task::none()
             }
             Message::EditPunchClockIp(s) => {
@@ -310,15 +343,23 @@ impl App {
         );
 
         let connected = {
-            let set = self
+            let mut parts: Vec<String> = Vec::new();
+            if self.clock_online && !self.clock_ip.is_empty() {
+                parts.push(format!("{}（RTC 輪詢）", self.clock_ip));
+            }
+            if let Ok(set) = self
                 .active_devices
                 .lock()
                 .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            if set.is_empty() {
+            {
+                for ip in set {
+                    parts.push(format!("{ip}（訊息埠）"));
+                }
+            }
+            if parts.is_empty() {
                 "（目前無卡鐘連線）".to_string()
             } else {
-                set.join(", ")
+                parts.join(", ")
             }
         };
 
@@ -341,6 +382,7 @@ impl App {
                 text("指令埠        "),
                 text_input("1621", &self.edit_port).on_input(Message::EditPort),
                 button("測試連線").on_press(Message::TestConnect),
+                button("卡鐘校時").on_press(Message::ClockSyncNow),
             ]
             .spacing(8),
             match &self.test_status {
@@ -366,6 +408,7 @@ impl App {
 
         let status = column![
             text(&self.status_line).size(14),
+            text(format!("卡鐘 RTC：{}", self.clock_rtc)).size(13),
             text(format!("監聽：{}", self.listen_addr)).size(13),
             text(format!("已連線卡鐘：{connected}")).size(13),
             text(gcp_line).size(13),
@@ -482,7 +525,7 @@ async fn test_tcp(ip: String, port: u16) -> Result<String, String> {
 
 #[cfg(all(test, target_os = "windows"))]
 mod ui_font_tests {
-    use iced_graphics::text::cosmic_text::{self, fontdb};
+    use iced_graphics::text::cosmic_text;
 
     const CJK_SAMPLE: &str =
         "打卡機中轉程式等待卡鐘連線轉拋儲存設定已連線離線最近刷卡命令埠測試錯誤GCP送達成功尚無本機位址填入後台";

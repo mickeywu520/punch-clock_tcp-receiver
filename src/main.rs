@@ -4,6 +4,7 @@ mod function_codes;
 mod model;
 mod parser;
 mod server;
+mod ua;
 mod ui;
 
 use std::sync::{Arc, Mutex};
@@ -56,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let ui = UiBus::new(ui_tx);
     let devices: server::DeviceTable = Arc::new(Mutex::new(Default::default()));
+    let (sync_tx, sync_rx) = mpsc::unbounded_channel::<ua::ClockSyncCmd>();
 
     let server_task = {
         let shared = shared.clone();
@@ -75,6 +77,19 @@ fn main() -> anyhow::Result<()> {
         rt.spawn(run_delivery(delivery, shared, Some(ui), rx))
     };
 
+    // Poll the card clock RTC periodically and auto-correct drift; also handles
+    // the GUI "卡鐘校時" button. Runs on the background runtime alongside the
+    // message server.
+    let sync_task = {
+        let shared = shared.clone();
+        let ui = ui.clone();
+        rt.spawn(async move {
+            if let Err(e) = ua::run_clock_sync(shared, Some(ui), sync_rx).await {
+                error!(err = %e, "clock sync worker exited");
+            }
+        })
+    };
+
     match rt.block_on(ui_enabled_from(&shared)) {
         true => {
             info!("starting desktop UI");
@@ -86,6 +101,7 @@ fn main() -> anyhow::Result<()> {
                     cfg_path: cfg_path.map(std::path::PathBuf::from),
                     active_devices: devices,
                     listen_addr: format!("{}:{}", g.listen.bind, g.listen.port),
+                    clock_sync_tx: sync_tx,
                     initial: ui::InitialSettings {
                         punch_clock_ip: g.punch_clock.ip.clone().unwrap_or_default(),
                         command_port: g.punch_clock.command_port.to_string(),
@@ -117,6 +133,8 @@ fn main() -> anyhow::Result<()> {
         server_task.abort();
         let _ = server_task.await;
         let _ = delivery_task.await;
+        sync_task.abort();
+        let _ = sync_task.await;
     });
     info!("shutdown complete");
     Ok(())

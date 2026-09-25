@@ -79,6 +79,34 @@ impl Default for PunchWindow {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct ClockSyncConfig {
+    /// 定時比對卡鐘 RTC（對 Host PC 時間），偏差超過 `max_drift_secs` 才自動校時
+    pub enabled: bool,
+    /// 比對週期（秒）
+    pub interval_secs: u64,
+    /// 允許最大偏差（秒）；超過才自動寫入 23H
+    pub max_drift_secs: i64,
+    /// 中斷後重連等待（秒）
+    pub reconnect_secs: u64,
+    /// RTC 欄位編碼：`true` = BCD（協定文件），`false` = 單一位元組十進位。
+    /// 本單位 AR837EF（firmware 4.6）實測為 raw decimal。
+    pub bcd_encoding: bool,
+}
+
+impl Default for ClockSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            max_drift_secs: 60,
+            reconnect_secs: 5,
+            bcd_encoding: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ClassifyConfig {
     pub enabled: bool,
     pub windows: Vec<PunchWindow>,
@@ -147,6 +175,7 @@ pub struct Config {
     pub log_level: String,
     pub classify: ClassifyConfig,
     pub gcp: GcpConfig,
+    pub clock_sync: ClockSyncConfig,
 }
 
 impl Default for Config {
@@ -162,6 +191,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             classify: ClassifyConfig::default(),
             gcp: GcpConfig::default(),
+            clock_sync: ClockSyncConfig::default(),
         }
     }
 }
@@ -217,6 +247,9 @@ fn apply_env_overrides(cfg: &mut Config) {
     }
     if let Some(lv) = env_string("PUNCH_LOG_LEVEL") {
         cfg.log_level = lv;
+    }
+    if let Some(v) = env_string("PUNCH_CLOCK_SYNC_ENABLED") {
+        cfg.clock_sync.enabled = !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no");
     }
 }
 
