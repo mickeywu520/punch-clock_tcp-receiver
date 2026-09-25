@@ -444,7 +444,7 @@ Transport 二選一：
     ]
   },
   "gcp": {
-    "endpoint_url": "https://punch-events-xxxxxx.run.app/api/punch-events",
+    "endpoint_url": "https://punch-events-xxxxxx.run.app/api/v1/punch-events",
     "bearer_token": "",
     "api_key_header": "X-Api-Key",
     "api_key_value": "",

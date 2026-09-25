@@ -11,7 +11,7 @@
 |---|---|---|
 | v0.1 | 2026-09-19 | 初稿：接收端轉拋契約（GCP 後台課堂出席整合之必要欄位與可靠性保證）。 |
 | v0.2 | 2026-09-25 | 補註 Free Access 情境：本機已啟用 Free Access 後，刷卡事件恆為 M03 Invalid card 但含完整 UID，後台比對以卡號為準、M03 亦須納入出席判定（主 PRD §2.9）。 |
-| v0.3 | 2026-09-25 | 中轉端 v1.6：送出 `card.site_code/card_code` 與 `device.port_number` 語意別名；push/pull 跨通道去重（10 分鐘視窗）防重複計出席；重連後補拉離線期間事件避免漏出席。 |
+| v0.3 | 2026-09-25 | 中轉端 v1.6：送出 `card.site_code/card_code` 與 `device.port_number` 語意別名；push/pull 跨通道去重（10 分鐘視窗）防重複計出席；重連後補拉離線期間事件避免漏出席。補 POST 實際格式圖錄（§10，實機樣本）；端點路徑更正為 `/api/v1/punch-events`。 |
 
 ---
 
@@ -72,7 +72,7 @@
 
 | 參數 | 值 |
 |---|---|
-| `gcp.endpoint_url` / `PUNCH_GCP_URL` | 後台 `POST /punch-events` |
+| `gcp.endpoint_url` / `PUNCH_GCP_URL` | 後台 `POST /api/v1/punch-events`（全站前綴 `/api/v1`，見附錄 §10） |
 | `gcp.api_key_header` / `PUNCH_GCP_API_KEY_HEADER` | `X-Api-Key` |
 | `gcp.api_key_value` / `PUNCH_GCP_API_KEY` | 後台 `PUNCH_API_KEY` 之值（勿進 git，用 `.env`/Secret Manager） |
 | `gcp.bearer_token` / `PUNCH_GCP_TOKEN` | （選用） |
@@ -87,7 +87,7 @@
 
 **結論：無需程式碼更動。** 僅部署設定確認：
 
-1. `PUNCH_GCP_URL` → 後台 `/punch-events`。
+1. `PUNCH_GCP_URL` → 後台 `/api/v1/punch-events`。
 2. `PUNCH_GCP_API_KEY_HEADER=X-Api-Key`、`PUNCH_GCP_API_KEY` → 後台 `PUNCH_API_KEY`。
 3. （視現場）`PUNCH_UI_ENABLED`、`PUNCH_RECEIVER_ID`。
 4. 打卡機校時 RTC。
@@ -106,5 +106,139 @@
 ## 9. 相關文件
 
 - `cramSchool_angular/backend/PRD_punch_class_integration.md`（後台版：課堂對應與出席判定）
-- 本專案 `PRD.md` v1.4（`GcpPunchEvent` 契約、轉拋/重試/spool、UI、校時）
+- 本專案 `PRD.md` v1.6（`GcpPunchEvent` 契約、轉拋/重試/spool、UI、校時）
 - 本專案 `config.example.json` / `src/forwarder.rs` / `src/model.rs`
+
+---
+
+## 10. 附錄：POST /api/v1/punch-events 實際請求／回應格式（v1.6 實機樣本）
+
+> 本附錄為**中介程式實際送出的請求格式**（v1.6，含 PRD §5.2 語意別名），
+> 供後台端點實作／測試對照。以下範例取自 2026-09-25 實機刷卡（card `FD6374F6`）與開機事件 spool。
+
+### 10.1 端點與標頭
+
+| 項目 | 值 |
+|---|---|
+| Method | `POST` |
+| Path | `/api/v1/punch-events`（`main.py` 全站前綴 `/api/v1`） |
+| `Content-Type` | `application/json` |
+| 認證 | `X-Api-Key: <PUNCH_API_KEY>`（後台 `verify_punch_api_key` 對 `settings.PUNCH_API_KEY`）；Bearer 亦可選用 |
+| Body | `{"events": [GcpPunchEvent, ...]}`，單筆或批次皆可 |
+
+### 10.2 單筆範例（M11 一般刷卡）
+
+```json
+{
+  "events": [
+    {
+      "schema_version": "v1",
+      "event_id": "e92e2a62-5cfd-4ead-a60d-8168c1f867b5",
+      "message_type": "punch_event",
+      "occurred_at": "2026-09-25T22:30:23+08:00",
+      "received_at": "2026-09-25T14:30:25.559073+00:00",
+      "device": {
+        "maker": "SOYAL",
+        "model": "AR837EF",
+        "node_id": 0,
+        "ip": "192.168.1.127",
+        "source_sub_code": 17,
+        "port_number": 17
+      },
+      "event": {
+        "function_code": 11,
+        "event_code": "M11",
+        "description": "Normal Access",
+        "door_no": 1
+      },
+      "card": {
+        "uid_hex": "00000000FD6374F6",
+        "uid_decimal": 4251153654,
+        "card_number_hi": 64867,
+        "card_number_lo": 29942,
+        "site_code": 64867,
+        "card_code": 29942
+      },
+      "person": {
+        "alias": "",
+        "user_id": null
+      },
+      "punch": {
+        "punch_type": "check_out",
+        "duty_code": null,
+        "duty_label": null
+      },
+      "ingested_by": {
+        "receiver_id": "punch-clock-01"
+      },
+      "raw_message": "26'09/25 22:30:23 [000.17:0B](1)00000000FD6374F6 (M11)Normal Access"
+    }
+  ]
+}
+```
+
+### 10.3 系統事件範例（M24 開機，無卡）：`card` 全空
+
+```json
+{
+  "events": [
+    {
+      "schema_version": "v1",
+      "event_id": "b32f8246-0ac1-4870-9e3b-f26ae18ad378",
+      "message_type": "punch_event",
+      "occurred_at": "2026-09-25T21:59:31+08:00",
+      "received_at": "2026-09-25T13:59:51.462279+00:00",
+      "device": { "maker": "SOYAL", "model": "AR837EF", "node_id": 1, "ip": "192.168.1.127", "source_sub_code": 17, "port_number": null },
+      "event": { "function_code": 24, "event_code": "M24", "description": "Controller Power On", "door_no": 0 },
+      "card": { "uid_hex": "", "uid_decimal": null, "card_number_hi": null, "card_number_lo": null, "site_code": null, "card_code": null },
+      "person": { "alias": "", "user_id": null },
+      "punch": { "punch_type": "unknown", "duty_code": null, "duty_label": null },
+      "ingested_by": { "receiver_id": "punch-clock-01" },
+      "raw_message": "26'09/25 21:59:31 [001.17:18](0) (M24)Controller Power On"
+    }
+  ]
+}
+```
+
+`port_number` 為 Optional 欄位——v1.6 於 `source_sub_code` 有值時送出；無值時序列化為 `null`。
+
+### 10.4 回應格式（一律 HTTP 200 + per-item status）
+
+```json
+{
+  "received": 1,
+  "stored": 1,
+  "results": [
+    { "event_id": "e92e2a62-5cfd-4ead-a60d-8168c1f867b5", "status": "ok", "student_id": 12, "student_name": "王小明" }
+  ]
+}
+```
+
+`status` ∈ `ok | duplicate | unknown_card | inactive | error`。後台端點**永不回 4xx**（除 429）；
+5xx／429／timeout → 中介程式指數退避重送；其他 4xx → 視為永久失敗不重送、不撤 spool。
+
+### 10.5 冪等
+
+- 同一事件以 `event_id`（UUID）為唯一鍵；重試／spool 重送沿用同一 id → 後台回 `duplicate` 不重複計 `punch_count`。
+
+### 10.6 欄位型別 (GcpPunchEvent, v1.6)
+
+| 欄位 | 型別 | 說明 |
+|---|---|---|
+| `schema_version` | string | `"v1"` |
+| `event_id` | string | UUID v4，冪等鍵 |
+| `message_type` | string | `"punch_event"` |
+| `occurred_at` | string | RFC3339，**帶 +08:00**；來源機端 RTC（需校時） |
+| `received_at` | string\|null | RFC3339 UTC，接收端時鐘 |
+| `device.*` | object | `maker/model/node_id/ip/source_sub_code/port_number` |
+| `event.*` | object | `function_code(int)/event_code("M11")/description/door_no(int\|null)` |
+| `card.*` | object | `uid_hex(16碼大端)/uid_decimal(int\|null)/card_number_hi/lo(int\|null)/site_code/card_code(int\|null)` |
+| `person.alias/user_id` | string\|null | 機端別名（含顯示前綴，未正規化） |
+| `punch.punch_type` | string | `check_in/check_out/unknown`（本端時間窗 classify，選用） |
+| `ingested_by.receiver_id` | string | 設定值 `receiver_id` |
+| `raw_message` | string | 機端原始行，稽核 |
+
+### 10.7 中介程式送出行為速查（`src/forwarder.rs`，已實作）
+
+- 未設 `gcp.endpoint_url` → 只落 `spool/` 不送出；設定後**啟動時 replay** spool（沿用原 `event_id`）。
+- 批次：`batch_enabled` 且單筆 buffer 達 `batch_max_items` 或間隔 `batch_flush_interval_secs` flush；預設關閉（逐筆即送）。
