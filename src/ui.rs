@@ -210,8 +210,16 @@ impl App {
             listen_addr: flags.listen_addr,
             clock_ip: flags.initial.punch_clock_ip.clone(),
             local_ips,
-            edit_punch_clock_ip: flags.initial.punch_clock_ip,
-            edit_port: flags.initial.command_port,
+            edit_punch_clock_ip: if flags.initial.punch_clock_ip.is_empty() {
+                "192.168.1.127".to_string()
+            } else {
+                flags.initial.punch_clock_ip
+            },
+            edit_port: if flags.initial.command_port.is_empty() {
+                "1621".to_string()
+            } else {
+                flags.initial.command_port
+            },
             edit_endpoint: flags.initial.endpoint,
             edit_api_key: flags.initial.api_key,
             status_line: flags.initial.status_line,
@@ -374,13 +382,16 @@ impl App {
             text("卡鐘設定").size(18),
             row![
                 text("卡鐘 IP      "),
-                text_input("如 192.168.1.127", &self.edit_punch_clock_ip)
-                    .on_input(Message::EditPunchClockIp),
+                text_input("192.168.1.127", &self.edit_punch_clock_ip)
+                    .on_input(Message::EditPunchClockIp)
+                    .width(Length::Fixed(150.0)),
             ]
             .spacing(8),
             row![
                 text("指令埠        "),
-                text_input("1621", &self.edit_port).on_input(Message::EditPort),
+                text_input("1621", &self.edit_port)
+                    .on_input(Message::EditPort)
+                    .width(Length::Fixed(70.0)),
                 button("測試連線").on_press(Message::TestConnect),
                 button("卡鐘校時").on_press(Message::ClockSyncNow),
             ]
