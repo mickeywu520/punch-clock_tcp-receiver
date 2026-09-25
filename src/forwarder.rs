@@ -26,12 +26,8 @@ enum Outcome {
 }
 
 impl Delivery {
-    pub fn new(config: Arc<RwLock<Config>>, spool_dir: PathBuf) -> anyhow::Result<Self> {
-        let timeout = config
-            .blocking_read()
-            .gcp
-            .timeout_secs
-            .max(1);
+    pub async fn new(config: Arc<RwLock<Config>>, spool_dir: PathBuf) -> anyhow::Result<Self> {
+        let timeout = config.read().await.gcp.timeout_secs.max(1);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout))
             .build()
@@ -44,8 +40,8 @@ impl Delivery {
         })
     }
 
-    pub fn configured(&self) -> bool {
-        self.config.blocking_read().gcp.endpoint_url.is_some()
+    pub async fn configured(&self) -> bool {
+        self.config.read().await.gcp.endpoint_url.is_some()
     }
 
     pub async fn deliver(&self, events: &[GcpPunchEvent]) -> Result<u64, String> {
@@ -126,7 +122,7 @@ impl Delivery {
     }
 
     pub async fn replay_spool(&self) -> anyhow::Result<(usize, usize)> {
-        if !self.configured() {
+        if !self.configured().await {
             return Ok((0, 0));
         }
         let mut sent = 0usize;

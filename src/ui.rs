@@ -77,12 +77,23 @@ pub fn local_ipv4() -> Vec<String> {
 // iced Application
 // ---------------------------------------------------------------------------
 
+/// Values the UI should start with (read once by `main` inside the runtime).
+#[derive(Debug, Clone, Default)]
+pub struct InitialSettings {
+    pub punch_clock_ip: String,
+    pub command_port: String,
+    pub endpoint: String,
+    pub api_key: String,
+    pub status_line: String,
+}
+
 pub struct Flags {
     pub ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub cfg_path: Option<PathBuf>,
     pub active_devices: Arc<Mutex<HashMap<String, u32>>>,
     pub listen_addr: String,
+    pub initial: InitialSettings,
 }
 
 impl Default for Flags {
@@ -94,6 +105,7 @@ impl Default for Flags {
             cfg_path: None,
             active_devices: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
+            initial: InitialSettings::default(),
         }
     }
 }
@@ -160,47 +172,23 @@ impl Application for App {
     type Flags = Flags;
 
     fn new(flags: Self::Flags) -> (Self, Command<Message>) {
-        let initial = {
-            let listen = flags.config.blocking_read();
-            (
-                listen.punch_clock.ip.clone().unwrap_or_default(),
-                listen.punch_clock.command_port.to_string(),
-                listen.gcp.endpoint_url.clone().unwrap_or_default(),
-                listen.gcp.api_key_value.clone().unwrap_or_default(),
-                format!(
-                    "就緒。本機監聽 {}:{}，GCP {}。",
-                    listen.listen.bind,
-                    listen.listen.port,
-                    if listen.gcp.endpoint_url.is_some() {
-                        "已設定"
-                    } else {
-                        "未設定"
-                    }
-                ),
-            )
-        };
         let local_ips = local_ipv4();
-        let listen_addr = flags.listen_addr.clone();
-        let mut app = App {
+        let app = App {
             external: flags.config,
             cfg_path: flags.cfg_path,
             rx: flags.ui_rx,
             active_devices: flags.active_devices,
-            listen_addr,
+            listen_addr: flags.listen_addr,
             local_ips,
-            edit_punch_clock_ip: String::new(),
-            edit_port: String::new(),
-            edit_endpoint: String::new(),
-            edit_api_key: String::new(),
-            status_line: initial.4,
+            edit_punch_clock_ip: flags.initial.punch_clock_ip,
+            edit_port: flags.initial.command_port,
+            edit_endpoint: flags.initial.endpoint,
+            edit_api_key: flags.initial.api_key,
+            status_line: flags.initial.status_line,
             test_status: None,
             last_events: Vec::new(),
             gcp_status: None,
         };
-        app.edit_punch_clock_ip = initial.0;
-        app.edit_port = initial.1;
-        app.edit_endpoint = initial.2;
-        app.edit_api_key = initial.3;
         (app, Command::none())
     }
 

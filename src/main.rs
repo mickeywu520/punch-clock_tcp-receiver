@@ -22,6 +22,14 @@ use ui::{UiBus, UiEvent};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // wgpu's DX12 backend segfaults (0xC0000005) during adapter enumeration on
+    // multi-GPU machines (RTX + AMD + Basic Render Driver). Force the GL
+    // backend by default on Windows unless the caller set WGPU_BACKEND.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "gl");
+    }
+
     let cfg_path = std::env::args().nth(1);
     let cfg = config::load(cfg_path.as_deref())?;
     init_tracing(&cfg.log_level)?;
@@ -49,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { server::run(shared, tx, Some(ui), devices).await })
     };
 
-    let delivery = Arc::new(Delivery::new(shared.clone(), spool_dir_from(&shared).await)?);
+    let delivery = Arc::new(Delivery::new(shared.clone(), spool_dir_from(&shared).await).await?);
     let delivery_task = {
         let shared = shared.clone();
         let ui = ui.clone();
@@ -59,12 +67,29 @@ async fn main() -> anyhow::Result<()> {
     match ui_enabled_from(&shared).await {
         true => {
             info!("starting desktop UI");
+            let initial = ui::InitialSettings {
+                punch_clock_ip: shared.read().await.punch_clock.ip.clone().unwrap_or_default(),
+                command_port: shared.read().await.punch_clock.command_port.to_string(),
+                endpoint: shared.read().await.gcp.endpoint_url.clone().unwrap_or_default(),
+                api_key: shared.read().await.gcp.api_key_value.clone().unwrap_or_default(),
+                status_line: format!(
+                    "就緒。本機監聽 {}:{}，GCP {}。",
+                    shared.read().await.listen.bind,
+                    shared.read().await.listen.port,
+                    if shared.read().await.gcp.endpoint_url.is_some() {
+                        "已設定"
+                    } else {
+                        "未設定"
+                    }
+                ),
+            };
             let flags = ui::Flags {
                 ui_rx,
                 config: shared.clone(),
                 cfg_path: cfg_path.map(std::path::PathBuf::from),
                 active_devices: devices,
                 listen_addr: listen_addr_from(&shared).await,
+                initial,
             };
             ui::run(flags)?;
         }
@@ -130,7 +155,7 @@ async fn run_delivery(
         (g.gcp.batch_enabled, g.spool_dir.clone())
     };
 
-    if delivery.configured() {
+    if delivery.configured().await {
         let (sent, kept) = delivery.replay_spool().await?;
         info!(sent, kept, "spool replay finished");
     } else {
