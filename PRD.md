@@ -1,7 +1,7 @@
 # PRD — SOYAL AR837EF 打卡機整合 (Rust TCP Receiver → GCP)
 
-- 版本：v1.4
-- 日期：2026-09-19
+- 版本：v1.6
+- 日期：2026-09-25
 - 狀態：草案 / 待複核
 
 | 版本 | 日期 | 修訂內容 |
@@ -11,6 +11,8 @@
 | v1.2 | 2026-09-19 | **實機驗證後修正**（裝置 `192.168.1.127:1621`、AR-821EFv5、體 4V6、Node ID 1）：<br>① 新增 §2.1 實測設備資訊、§2.7 實機驗證記錄（含實際 TX/RX 封包）；<br>② §2.2 更正：寫入型指令（`83H`/`84H`/`85H`/`87H`/`2EH`）**在一般 TCP 指令埠即可用**，不需 8033 雙向 hosting；<br>③ §2.5 更正人員記錄長度：`83H`/`84H` 下載 26 bytes（含位址）、`87H` 回讀 24 bytes（**不含位址**）；<br>④ §2.5 確認位址與 UID 為**大端順序**；<br>⑤ §3.2、§7 同步修正被推翻的假設；<br>⑥ §8 新增機端 RTC 校時驗收項（實測機端時間為 2010-11-09）。 |
 | v1.3 | 2026-09-19 | **實機新增人員／掃描／整表清除驗證後補充**：<br>① §2.7 新增實測：`87H` 多筆讀取上限（`nums≤10` 完整、`>10` 回應截斷）、`85H` 整表清除 `0~16383` 耗時 >3s（冪等可重送）、`2EH` 姓名 Big5 實機寫入成功、`site:card` 十進位卡號建立人員流程；<br>② 新增 §2.8「後台 user list 空／有效狀態對照」；<br>③ §7 補充人員／白名單同步實作前提（位址需明示指派、建議 0 起、批次上限 10、姓名另存於 2EH、中文別名編碼待驗）與 §7.1 **GCP 串接注意事項**；<br>④ 工具支援：`punch_admin.py --uid site:card`、`scan-users` 批次截斷自動降級（selftest 43 項）。 |
 | v1.4 | 2026-09-19 | **中介程式 + iced UI（顯示本機 IP／狀態面板）新增**：<br>① §2.2 補「現場設定流程」（後台 `Message Server IP 1st` 預設 `0.0.0.0`、`Port 1st` 預設 `0`＝關閉；填上 receiver 的 IP + 8031 儲存後，**每次刷卡即自動推送**，不需其他設定）；<br>② §3 新增 FR-10（iced UI 大字顯示本機 IPv4，供施工人員照抄填入後台）、FR-11（UI 狀態面板：監聽／連線裝置／最近事件／GCP 上送）、FR-12（`--headless` 無 GUI 環境可用），§3.1 補部署彈性；<br>③ §4 系統流程補 UI 顯示分支；<br>④ §6 設定新增 `ui.enabled`（`PUNCH_UI_ENABLED`）；<br>⑤ §8 驗收補 GUI 施工流程項。 |
+| v1.5 | 2026-09-25 | **Free Access 通行模式與事件登錄實測補充**：<br>① 新增加 §2.9——卡片在 User List 但通行時區禁用時，刷卡**不建立事件**；以 TCP 指令埠 `20H`（Set）/`12H`（Get）sub-code `19H` 啟用並確認 Free Access；啟用後每次刷卡記錄為 **M03 Invalid card 但含完整卡 UID**；<br>② 記錄事件佇列**單一來源**（後台 Event Log／µA `25H`／8031 推播同一佇列），與 8031 推播僅在重開機／開機時出現之實測（§2.2「每次刷卡即自動推送」於此機不符）→ 即時打卡改採 **25H/37H 主動拉取**之依據；<br>③ 修正 Access Mode 的 Get 指令為 **`12H`（控制器參數），非 `1BH`**。 |
+| v1.6 | 2026-09-25 | **中轉程式完善（去重／語意化別名／事件碼修正／重連 forward 修正）**：<br>① 新增 **push/pull 跨通道去重**（`src/dedup.rs`，以 `occurred_at+UID+event_code` 為鍵、10 分鐘滑動視窗）——8031 推播與 25H/37H 拉取源自同一事件佇列（§2.9），重開機時兩通道可能各轉送同一筆而生不同 `event_id`，改由中轉端去重；<br>② 送出 §5.2 預留之語意化別名：`device.port_number`（＝`source_sub_code`）、`card.site_code`（＝`card_number_hi`）、`card.card_code`（＝`card_number_lo`）——後台版 PRD §7 選用增強交付；<br>③ **修正 `src/function_codes.rs` 30~34 位移錯誤**（附錄 A 已知落差）：30=Anti-pass back、31/32=副讀卡機離線/連線、33/34=用戶修改密碼/失敗；<br>④ 修正重連邏輯：非首次連線一律 forward 離線期間累積事件（原先 `first_session && forward_initial` 使**每次重連都靜默 37H 刪除事件**，與註解「later sessions forward」相反，造成後台 Event Log 有 M11 但 receiver 收不到）；25H 讀取錯誤改為連線層錯誤即拆 session 重連、僅 timeout 保留 session。 |
 
 ---
 
@@ -65,6 +67,8 @@ SOYAL 網路型控制器本身提供 **Message Server** 主動推播功能：在
 > 若無整合需求，官方建議 Message Server IP 填 `0.0.0.0`、Port 填 `0` 關閉。我們會改成 receiver 的 IP。
 
 > **現場設定流程（v1.4）**：施工人員於打卡機後台 `Network Setting`，把 `Message Server IP 1st` 填上 **receiver UI 顯示的本機 IP**、`Message Port 1st` 填 `8031`（TEXT）後存檔，此後**每次刷卡即自動推送**到 receiver，不需其他設定。後台預設顯示 `0.0.0.0`／`0` 即為「推播關閉」。receiver 的 **iced UI 會在啟動時列舉本機 IPv4**，大字顯示 `IP : 8031` 供照抄，避免施工人員手查 `ipconfig`。
+
+> ⚠️ **實測更正（v1.5，本機 AR-821EFv5／4V6）**：上述「每次刷卡即自動推送」於此機**實測不符**——8031 文字推播僅在**重開機／開機**時觀察到（後台按 update 觸發 reboot 才送出），刷卡當下不會推送。事件佇列與後台 Event Log 同一來源（見 §2.9），即時打卡需以 **25H/37H 主動拉取**補足。
 
 > **重要（實測更正 v1.2）**：上表是「**機器主動推播事件**」的設定（one-way hosting）。
 > 但**讀寫人員／卡片等指令型操作走的是另一個埠**：控制器的 **TCP 指令埠**（實測 `1621`），
@@ -221,6 +225,45 @@ SOYAL 網路型控制器本身提供 **Message Server** 主動推播功能：在
 
 ---
 
+### 2.9 通行模式 Free Access 與刷卡事件登錄（v1.5 實測，2026-09-25）
+
+> 背景情境：卡片已建入後台 User List（§2.8），但刷卡在後台 **Event Log**、`25H` 佇列、8031 推播上**完全沒有事件**。
+
+**根因**：卡片「存在 User List」⇄「通行時區是否允許」是兩件事。該員卡的通行時區在此機為禁用，
+刷卡當下被通行檢查擋下、**連事件記錄都不建立**——不是收不到，是事件佇列裡根本沒有那筆。
+（啟用 Free Access 之前，凡時區不合格的卡刷卡皆不會留下記錄。）
+
+**解法（TCP 指令埠 1621 直接下達，不需動後台 web）**：啟用 Free Access（主機免費進出）。
+
+| 步驟 | 指令 | 結果（實機） |
+|---|---|---|
+| 啟用 | `20H` Set Controller Access Mode，sub-code `19H`，data `19 01 00 00 00 08`（後五 byte：`01`=**freeMain**、`00`=free WG1、`00`=black UID、`00`=容量、`08`=Access Mode） | ACK `7E 0F 00 04 01 C3 46 0F 91 10 10 00 00 00 00 E1 AF` |
+| 回讀確認 | **`12H`**（⚠️ 是 `12H`，不是 `1BH`）Get Controller parameters，sub-code `19H` | echo `7E 0A 00 03 01 01 00 00 00 08 F4 01` → freeMain byte = `01`（已啟用） |
+
+**啟用後的行為**：每一次刷卡都會建立事件記錄進入事件佇列（後台 Event Log 可見）。
+因該卡並非完全有效的註冊用戶（時區仍禁用），記錄為 **M03 Invalid card**，但**含完整卡 UID**。
+實測 `25H` 記錄（2026-09-25 19:54:06）：
+
+```
+7E 21 00 03 01 06 36 13 06 19 09 1A 11 74 F6 00 00 10 40 FD 63 01 00 74 F6 00 00 00 00 00 00 00 00 0C 37
+   └node└func └src └sec└min└hr └wd └day└mon └yy └port
+```
+
+- func `0x03`＝M03；sec/min/hour/weekday/day/month/year = `06 36 13 06 19 09 1A`（**raw decimal**）→ 19:54:06;
+  port `0x11`＝17；UID = `Data21/Data15/Data16/Data19/Data20` = `00 FD 63 74 F6` → **`00000000FD6374F6`**
+  （Site `64867` / Card `29942`）。
+
+**接收端設計含義（後續修改的依據）**
+
+1. **判斷「是否為考勤打卡」以「事件是否帶有效 Tag UID」為準，而不是事件碼**——Free Access 下刷卡恆為 M03，
+   若以事件碼（如只認 M11）篩選會全數漏掉；反之不含 UID 的系統事件（例 M24 Power On）才應略過。
+2. **事件佇列為單一來源**：後台 Event Log、µA `25H` 讀取、8031 文字推播三處讀到的是**同一個佇列**。
+3. **8031 推播此機並不可靠**：實測推播僅在**重開機／開機**（後台按 update 觸發 reboot）時出現，刷卡當下不會推送（見 §2.2 更正）。
+   即時打卡須靠 **25H/37H 主動拉取**：25H 讀一筆 → 37H 刪除 → 重複至佇列空。
+4. **Access Mode 的 SET/GET 指令**：`20H`＝Set、`12H`＝Get，sub-code 皆 `19H`（Get 用 **`12H`**，非 `1BH`）。
+
+---
+
 ## 3. 功能需求（Rust TCP Receiver）
 
 | # | 需求 | 驗收方式 |
@@ -342,7 +385,7 @@ TCP line ─▶ parser ─▶ PunchEvent ─┬─▶ iced UI 狀態面板（來
 | `device.node_id` | int | 是 | 機端 Node ID（`[001...]`） |
 | `device.ip` | string | 是 | 連線來源 IP |
 | `device.source_sub_code` | int | 是 | TEXT `[ ]` 中間欄＝**Port Number**（`881E §4.1 Data 8`：17 主埠、18 WG1、19 WG2、1~16 多門子機）。※ 欄位名沿用 v1 實作（`src/model.rs`），語意化別名見下一列，**不刪除本欄位** |
-| `device.port_number` | int\|null | 否 | 與 `device.source_sub_code` 同值之語意化別名（Port Number）。**v1 未產生**，見 §7 |
+| `device.port_number` | int\|null | 否 | 與 `device.source_sub_code` 同值之語意化別名（Port Number）。**v1.6 已產生** |
 | `event.function_code` | int | 是 | 十進位事件碼（M 碼數值） |
 | `event.event_code` | string | 是 | `M{code}` |
 | `event.description` | string | 是 | 事件描述（機端提供者優先，缺省用內建對照表） |
@@ -351,8 +394,8 @@ TCP line ─▶ parser ─▶ PunchEvent ─┬─▶ iced UI 狀態面板（來
 | `card.uid_decimal` | int\|null | 否 | HEX 之 u64 十進位 |
 | `card.card_number_hi` | int\|null | 否 | Tag UID bit31~16（＝**Site Code**，十進位） |
 | `card.card_number_lo` | int\|null | 否 | Tag UID bit15~0（＝**Card Code**，十進位） |
-| `card.site_code` | int\|null | 否 | `card_number_hi` 之語意化別名。**v1 未產生** |
-| `card.card_code` | int\|null | 否 | `card_number_lo` 之語意化別名。**v1 未產生** |
+| `card.site_code` | int\|null | 否 | `card_number_hi` 之語意化別名。**v1.6 已產生** |
+| `card.card_code` | int\|null | 否 | `card_number_lo` 之語意化別名。**v1.6 已產生** |
 | `card.user_address` | int\|null | 否 | 機端人員索引（`881E §4.1 Data 9/10`；無效卡片事件時為 Tag ID bit15~08/07~00）。**TEXT 模式一律 null**，需 8033 HEX；**v1 未產生** |
 | `card.user_level` | int\|null | 否 | 使用者等級（`Data 14`）。**TEXT 模式一律 null**；**v1 未產生** |
 | `person.alias` | string\|null | 否 | 用戶別名（機端下載之姓名） |
@@ -424,7 +467,7 @@ Transport 二選一：
 |---|---|---|
 | 8033 推播 hosting 模式 | 機器主動推播事件的另一通道；v1 只需 8031 即可 | 與指令埠（1621）無關，見 §2.7 |
 | 人員／白名單同步 | 由雲端下發 `83H`/`84H`（`User Addr`、`Tag UID`、`PIN`、`Mode`、`Zone`、`Group1/2`、`Year/Month/Day`、`Level`、`Option`，每筆 26 bytes）、`2EH` 寫入姓名（16 bytes）、`85H` 刪除、`87H` 查詢 | **已實測可行：一般 TCP 指令埠 + ACK，不需 8033**；現可用 `tools/punch_admin.py`；H / E 系列封包長度不同（§2.5、§2.7） |
-| 卡片資訊擴充 | 新增 `card.user_address`、`card.user_level`、`card.site_code`、`card.card_code`、`device.port_number`（§5.2） | 需 8033 HEX 或 `87H` 反查（實測 `87H` 回讀**不含位址**，需自行比對） |
+| 卡片資訊擴充 | 新增 `card.user_address`、`card.user_level`（`card.site_code`、`card.card_code`、`device.port_number` 已於 **v1.6** 送出） | 需 8033 HEX 或 `87H` 反查（實測 `87H` 回讀**不含位址**，需自行比對） |
 | 多台分機管理 | 依 `device.ip` / Node ID 分派不同雲端 endpoint 或專案 | 設定可多 entry |
 | 卡號遮蔽（PII） | Hash UID 原文再上送，避免明文外洩 | 資安強化 |
 | 心跳／離線偵測 | 若同 Node 一段時間無事件，上送 offline 告警 | 需機端配合間隔送 CNJ |
@@ -444,8 +487,9 @@ Transport 二選一：
   建議在 receiver 去除前綴後再上送，或在 GCP parser 正規化。中文別名編碼（Big5？）尚未實機驗證
   （見上「串接前提」）。
 - `card.site_code` / `card.card_code`：名冊建立已可用工具 `--uid site:card` 匯入（§2.6、§2.7）；
-  GCP 端對應欄位已在 §5.2 預留，但目前 `src/model.rs` 尚無輸出，v1 仍以
-  `card.card_number_hi` / `card.card_number_lo` 呈現（§7「卡片資訊擴充」再行補上）。
+  GCP 端對應欄位已在 §5.2 預留，**v1.6 起 `src/model.rs` 已同步輸出**
+  `card.site_code`（＝`card_number_hi`）與 `card.card_code`（＝`card_number_lo`），
+  `card.card_number_hi` / `card.card_number_lo` 仍保留以向後相容。
 - 名冊建立路徑（v1.3 實測可行）：`punch_admin.py add-user --addr N --uid site:card --name 姓名 --yes`
   一次完成「人員＋卡片＋姓名」，為 §7「人員／白名單同步」的離線對照與匯入來源。
 
@@ -499,8 +543,8 @@ Transport 二選一：
 | 27 | M27 | 求救按鈕已啟動 | Help push button pressed | — |
 | 28 | M28 | 以密碼操作通行 | Access by PIN (Key Only) | ★ |
 | 29 | M29 | DI 輸入點動作（SubCode 00=Off / 01=On） | Digital input actives | ★ |
-| 30 / 31 / 32 | M30 / M31 / M32 | 違反進出管制 / RS485 讀卡機離線 / 重新連線 | Anti-pass back Error / reader off-line / on-line | ⚠️ 見下方落差 |
-| 33 / 34 | M33 / M34 | 使用者自行更改密碼 / 更改失敗 | User PIN code changed / error | ⚠️ 見下方落差 |
+| 30 / 31 / 32 | M30 / M31 / M32 | 違反進出管制 / RS485 讀卡機離線 / 重新連線 | Anti-pass back Error / reader off-line / on-line | ★ |
+| 33 / 34 | M33 / M34 | 使用者自行更改密碼 / 更改失敗 | User PIN code changed / error | ★ |
 | 35 / 36 | M35 / M36 | 進入 / 結束自動開門程序 | Enter / Exit Auto Door Open Procedure | ★ |
 | 37 / 38 | M37 / M38 | 自動解除 / 啟動警戒 | Auto Disarmed / Armed | — |
 | 39 / 40 | M39 / M40 | 以指紋或靜脈通行 / 指紋辨識失敗 | Access by fingerprint or finger vein / identify failed | ★ |
@@ -518,7 +562,7 @@ Transport 二選一：
 | 108 / 110 | M108 / M110 | 人臉辨識成功 / 車牌辨識成功 | Face / Car plate Recognize OK | — |
 | 114 | M114 | 遠端考勤（SubCode 1 遠端進入 / 2 遠端離開 / 3 修改進入 / 4 修改離開） | Remote Time Attendance | ★ |
 
-> ⚠️ **已知落差（待修程式，非本文件範圍）**：`src/function_codes.rs` 於 30~33 對照有位移錯誤 —— code 30 / 31 目前對到「副讀卡機離線 / 連線」（datasheet 應為 M31 / M32），code 32 / 33 對到「用戶修改密碼 / 失敗」（datasheet 應為 M33 / M34），且 code 34 未定義。修正前，該區間請以機端回傳文字為準。此落差已於 v1.1 記錄，程式側修正另行排程。
+> ✅ **已知落差（v1.6 已修正）**：`src/function_codes.rs` 於 30~34 原有位移錯誤（code 30 / 31 對到「副讀卡機離線 / 連線」、code 32 / 33 對到「用戶修改密碼 / 失敗」、code 34 未定義），v1.6 已對齊 datasheet：30=Anti-pass back、31/32=副讀卡機離線/連線、33/34=用戶修改密碼/失敗。
 > ⚠️ **M20 / M21 語意衝突**：`Message File structure.pdf` 註明「`message type`(field 98) = 0x00 且 Field 10 function code 為 20 / 21 時，該筆為 701Client **軟體登入 / 登出**，buffer[12~41] 為操作者姓名、buffer[96] 為系統 user index」；而控制器 event log 的 M20 / M21 為「電源關閉 / 被脅迫」。接收端收到 20 / 21 時須以來源（訊息類型）區分，**不可一律視為考勤事件**。
 > 完整表請參考 `Protocol_881E_725Ev2_82xEv5 4V05.pdf` §4.2 與 `Message File structure.pdf`「Controller Function code define」。
 

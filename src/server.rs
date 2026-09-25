@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{Config, ListenMode, PunchWindow};
+use crate::dedup::PunchDedup;
 use crate::model::{GcpPunchEvent, PunchEvent};
 use crate::parser;
 use crate::ui::{UiBus, UiEvent};
@@ -17,11 +18,15 @@ use crate::ui::{UiBus, UiEvent};
 /// Live connection count per source IP, shared with the GUI.
 pub type DeviceTable = Arc<Mutex<HashMap<String, u32>>>;
 
+/// Cross-channel (8031 push / 25H pull) dedup guard.
+pub type DedupGuard = Arc<Mutex<PunchDedup>>;
+
 pub async fn run(
     cfg: Arc<RwLock<Config>>,
     tx: UnboundedSender<GcpPunchEvent>,
     ui: Option<UiBus>,
     devices: DeviceTable,
+    dedup: DedupGuard,
 ) -> anyhow::Result<()> {
     if cfg.read().await.listen.mode != ListenMode::Text {
         anyhow::bail!(
@@ -50,8 +55,9 @@ pub async fn run(
         let tx = tx.clone();
         let ui = ui.clone();
         let devices = devices.clone();
+        let dedup = dedup.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, peer, &cfg, tx, ui, devices).await {
+            if let Err(e) = handle_conn(stream, peer, &cfg, tx, ui, devices, dedup).await {
                 warn!(peer = %peer, err = %e, "connection handler error");
             }
         });
@@ -70,6 +76,7 @@ async fn handle_conn(
     tx: UnboundedSender<GcpPunchEvent>,
     ui: Option<UiBus>,
     devices: DeviceTable,
+    dedup: DedupGuard,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true).ok();
     info!(peer = %peer, "device connected");
@@ -101,6 +108,24 @@ async fn handle_conn(
         match parser::parse_text_line(trimmed, timezone_offset) {
             Ok(punch) => {
                 let mut punch = punch;
+                let dup = {
+                    let mut guard = dedup.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.is_duplicate(
+                        punch.occurred_at.timestamp(),
+                        &punch.uid_hex,
+                        &punch.event_code,
+                    )
+                };
+                if dup {
+                    info!(
+                        peer = %peer,
+                        event = %punch.event_code,
+                        uid = %punch.uid_hex,
+                        occurred_at = %punch.occurred_at.to_rfc3339(),
+                        "punch event duplicate, skipping"
+                    );
+                    continue;
+                }
                 if classify_enabled && !windows.is_empty() {
                     punch = classify_windows(punch, &windows);
                 }
@@ -153,7 +178,7 @@ async fn handle_conn(
     Ok(())
 }
 
-fn classify_windows(mut punch: PunchEvent, windows: &[PunchWindow]) -> PunchEvent {
+pub(crate) fn classify_windows(mut punch: PunchEvent, windows: &[PunchWindow]) -> PunchEvent {
     let minutes = punch.occurred_at.hour() as u32 * 60 + punch.occurred_at.minute() as u32;
     for w in windows {
         if window_contains(w, minutes) {

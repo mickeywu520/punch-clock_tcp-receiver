@@ -1,15 +1,17 @@
 # PRD — 打卡機課堂出席整合：接收端（中介程式）轉拋契約
 
-- 版本：v0.1（草稿，供討論）
-- 日期：2026-09-19
+- 版本：v0.3（草稿，供討論）
+- 日期：2026-09-25
 - 對應文件：
   - **本文件**＝接收端（`punch-clock_tcp-receiver`，Rust）側契約。
   - **後台版**＝`cramSchool_angular/backend/PRD_punch_class_integration.md`，負責「刷卡→課堂對應→出席判定」。
-  - 本專案總 PRD＝`PRD.md`（v1.4，接收端整體規格與 `GcpPunchEvent` 資料契約）。
+  - 本專案總 PRD＝`PRD.md`（v1.6，接收端整體規格與 `GcpPunchEvent` 資料契約）。
 
 | 版本 | 日期 | 修訂內容 |
 |---|---|---|
 | v0.1 | 2026-09-19 | 初稿：接收端轉拋契約（GCP 後台課堂出席整合之必要欄位與可靠性保證）。 |
+| v0.2 | 2026-09-25 | 補註 Free Access 情境：本機已啟用 Free Access 後，刷卡事件恆為 M03 Invalid card 但含完整 UID，後台比對以卡號為準、M03 亦須納入出席判定（主 PRD §2.9）。 |
+| v0.3 | 2026-09-25 | 中轉端 v1.6：送出 `card.site_code/card_code` 與 `device.port_number` 語意別名；push/pull 跨通道去重（10 分鐘視窗）防重複計出席；重連後補拉離線期間事件避免漏出席。 |
 
 ---
 
@@ -27,6 +29,10 @@
 2. **不改判**：`punch.punch_type`（本端時間窗 classify）只是選用資訊；後台課堂比對**只認 `occurred_at + card`**，不依賴 `punch_type`。
 3. **一事件一 `event_id`**：解析時產生一次，重試／spool 重送沿用同一 id → 後台可冪等去重，`punch_count` 不重複計。
 4. **欄位齊全**：後台課堂出席所需的欄位全部出現（§3 對照表），含 `raw_message` 稽核原行。
+
+> 📌 **Free Access 情境（v0.2）**：本機已以 TCP 指令埠啟用 Free Access（`20H` sub `19H`，詳主 PRD §2.9），
+> 每次刷卡都會登錄事件並轉送；因卡非完全有效註冊用戶（時區禁用），事件碼恆為 **M03 Invalid card** 但**含完整卡 UID**。
+> 後台課堂比對以卡號為準（§3 對照），**M03 亦須照常納入出席判定**，不可只認 M11。
 
 ## 3. 轉拋資料 → 後台課堂出席需求對照（Alignment）
 
@@ -87,7 +93,7 @@
 4. 打卡機校時 RTC。
 
 選用增強（非本次必須；屬本專案 `PRD.md` §7 既有規劃）：
-- 送出 `card.site_code/card_code` 語意別名、`card.user_address`、`device.port_number`（後台欄位已預留，v1 未送）。
+- `card.site_code`/`card_code` 語意別名、`device.port_number` 已於 v1.6 送出（後台欄位已預留）；`card.user_address` 仍未送（需 8033 HEX 或 `87H` 反查）。
 
 ## 8. 驗收（對應後台版 PRD §7 情境）
 

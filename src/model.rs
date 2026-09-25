@@ -43,6 +43,9 @@ pub struct GcpDevice {
     pub node_id: u32,
     pub ip: String,
     pub source_sub_code: u32,
+    /// Semantic alias of `source_sub_code` (SOYAL Port Number: 17 main port,
+    /// 18 WG1, 19 WG2, 1..=16 RS485 sub readers). PRD §5.2.
+    pub port_number: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +64,10 @@ pub struct GcpCard {
     pub uid_decimal: Option<u64>,
     pub card_number_hi: Option<u32>,
     pub card_number_lo: Option<u32>,
+    /// Semantic alias of `card_number_hi` (Tag UID bit31~16). PRD §5.2.
+    pub site_code: Option<u32>,
+    /// Semantic alias of `card_number_lo` (Tag UID bit15~0). PRD §5.2.
+    pub card_code: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +136,7 @@ impl GcpPunchEvent {
                 node_id: p.node_id,
                 ip: peer_ip.to_string(),
                 source_sub_code: p.sub_code,
+                port_number: p.sub_code,
             },
             event: GcpEvent {
                 function_code: p.function_code,
@@ -141,6 +149,8 @@ impl GcpPunchEvent {
                 uid_decimal,
                 card_number_hi: card_hi,
                 card_number_lo: card_lo,
+                site_code: card_hi,
+                card_code: card_lo,
             },
             person: GcpPerson {
                 alias: Some(p.username.clone()),
@@ -206,8 +216,11 @@ mod tests {
         assert_eq!(gcp.card.uid_hex, "00000000D4B81403");
         assert_eq!(gcp.card.card_number_hi, Some(0xD4B8));
         assert_eq!(gcp.card.card_number_lo, Some(0x1403));
+        assert_eq!(gcp.card.site_code, Some(0xD4B8));
+        assert_eq!(gcp.card.card_code, Some(0x1403));
         assert_eq!(gcp.device.node_id, 1);
         assert_eq!(gcp.device.source_sub_code, 17);
+        assert_eq!(gcp.device.port_number, 17);
         assert_eq!(gcp.event.event_code, "M11");
         assert_eq!(gcp.message_type, "punch_event");
         assert!(gcp.occurred_at.ends_with("+08:00"));

@@ -18,6 +18,12 @@
     "reconnect_secs": 5,
     "bcd_encoding": false
   },
+  "event_pull": {
+    "enabled": true,
+    "interval_secs": 2,
+    "forward_initial": false,
+    "max_events_per_tick": 200
+  },
   "device": {
     "maker": "SOYAL",
     "model": "AR837EF"

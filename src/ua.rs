@@ -1,24 +1,35 @@
-//! SOYAL µA (E-series) protocol client: active TCP polling of the punch clock
-//! and RTC read/sync against the host PC clock.
+//! SOYAL µA (E-series) protocol client: active TCP polling of the punch clock,
+//! RTC read/sync against the host PC clock, and 25H/37H event-queue pull.
 //!
 //! The card clock accepts our polling connection on its own command port
 //! (default 1621) while it also pushes events to the message port (8031).
+//! On this unit (AR-821EFv5, firmware 4V6) the 8031 push only fires on
+//! power-on/reboot, so real-time punches are fetched via the event-queue pull
+//! instead (25H read one record -> 37H delete -> repeat until the queue is
+//! empty). See PRD §2.9.
 //! Commands used:
 //!   * `24H` - read device real time clock
 //!   * `23H` - set device real time clock (BCD: sec/min/hour/week/day/month/year)
+//!   * `25H` - read next event-log record (top of queue)
+//!   * `37H` - delete the record just read
 //! Frame (standard): `7E <len> <node> <cmd> <data...> <xor> <sum>`
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, FixedOffset, Local, NaiveDate, TimeZone, Timelike, Utc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::dedup::PunchDedup;
+use crate::function_codes;
+use crate::model::{GcpPunchEvent, PunchEvent};
+use crate::server::classify_windows;
 use crate::ui::{UiBus, UiEvent};
 
 /// Commands the GUI can send to the clock-sync worker.
@@ -211,11 +222,14 @@ fn target(cfg: &Config) -> Option<(String, u16)> {
 
 /// Runs the clock-sync worker: keep one polling TCP session to the card clock,
 /// periodically compare RTC to the host clock, auto-correct when drift exceeds
-/// `clock_sync.max_drift_secs`, and honour manual `ClockSyncCmd::SyncNow`.
+/// `clock_sync.max_drift_secs`, honour manual `ClockSyncCmd::SyncNow`, and pull
+/// the 25H/37H event queue on a separate tick into the UI / GCP pipeline.
 pub async fn run_clock_sync(
     cfg: Arc<RwLock<Config>>,
     ui: Option<UiBus>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClockSyncCmd>,
+    tx: UnboundedSender<GcpPunchEvent>,
+    dedup: Arc<std::sync::Mutex<PunchDedup>>,
 ) -> anyhow::Result<()> {
     let (ip, port) = loop {
         if let Some(t) = { let g = cfg.read().await; target(&g) } {
@@ -241,11 +255,23 @@ pub async fn run_clock_sync(
     };
 
     info!(%addr, "clock sync worker starting");
+    let mut first_session = true;
     loop {
         let reconnect_secs = cfg.read().await.clock_sync.reconnect_secs.max(1);
-        if let Err(e) = manage_session(&cfg, &ui, &mut cmd_rx, addr).await {
+        if let Err(e) = manage_session(
+            &cfg,
+            &ui,
+            &mut cmd_rx,
+            &tx,
+            &dedup,
+            addr,
+            first_session,
+        )
+        .await
+        {
             warn!(%addr, err = %e, "clock sync session ended");
         }
+        first_session = false;
         if let Some(ui) = &ui {
             ui.send(UiEvent::ClockStatus {
                 online: false,
@@ -269,7 +295,10 @@ async fn manage_session(
     cfg: &Arc<RwLock<Config>>,
     ui: &Option<UiBus>,
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClockSyncCmd>,
+    tx: &UnboundedSender<GcpPunchEvent>,
+    dedup: &Arc<std::sync::Mutex<PunchDedup>>,
     addr: SocketAddr,
+    first_session: bool,
 ) -> Result<(), String> {
     let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
@@ -288,31 +317,34 @@ async fn manage_session(
     // initial sync right after connecting
     sync_once(cfg, ui, &mut stream).await?;
 
+    // initial event-queue drain: only the *first* session may opt to silently
+    // discard the pre-commissioning backlog (`forward_initial = false`) so the
+    // 2010-era records do not reach GCP. On every reconnect we MUST forward
+    // whatever accumulated while offline — otherwise a punch that arrived while
+    // the session was down (e.g. 1621 contested by the backend) is deleted by
+    // 37H without ever reaching the UI / GCP pipeline.
+    let (ev_enabled, forward) = {
+        let g = cfg.read().await;
+        (g.event_pull.enabled, g.event_pull.forward_initial || !first_session)
+    };
+    if ev_enabled {
+        pull_events(cfg, ui, &mut stream, tx, dedup, forward).await?;
+    }
+
+    let sync_interval = { let g = cfg.read().await; g.clock_sync.interval_secs.max(10) };
+    let ev_interval = { let g = cfg.read().await; g.event_pull.interval_secs.max(1) };
+    let mut sync_tick = tokio::time::interval(Duration::from_secs(sync_interval));
+    let mut ev_tick = tokio::time::interval(Duration::from_secs(ev_interval));
+
     loop {
-        let (enabled, interval) = {
-            let g = cfg.read().await;
-            (g.clock_sync.enabled, g.clock_sync.interval_secs.max(10))
-        };
-        if !enabled {
-            // auto-sync disabled: idle until a manual request arrives or config flips
-            match cmd_rx.recv().await {
-                Some(ClockSyncCmd::SyncNow { ip, port }) => {
-                    match parse_addr(&ip, port) {
-                        Some(a) if a == addr => {
-                            force_sync(cfg, ui, &mut stream).await?;
-                        }
-                        _ => {
-                            oneshot_sync(cfg, ui, &ip, port).await.ok();
-                        }
-                    }
-                }
-                None => return Ok(()),
-            }
-            continue;
-        }
+        let sync_enabled = cfg.read().await.clock_sync.enabled;
+        let ev_enabled = cfg.read().await.event_pull.enabled;
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+            _ = sync_tick.tick(), if sync_enabled => {
                 sync_once(cfg, ui, &mut stream).await?;
+            }
+            _ = ev_tick.tick(), if ev_enabled => {
+                pull_events(cfg, ui, &mut stream, tx, dedup, true).await?;
             }
             cmd = cmd_rx.recv() => match cmd {
                 Some(ClockSyncCmd::SyncNow { ip, port }) => {
@@ -475,6 +507,205 @@ async fn force_sync(
     Ok(())
 }
 
+/// Drains the 25H/37H event queue (FIFO) while records keep arriving.
+/// Each record is deleted (37H) right after reading so the queue advances;
+/// no-UID records (power-on etc.) are skipped. When `forward` is set, parsed
+/// punch events flow into the classify -> GCP pipeline and the UI.
+async fn pull_events(
+    cfg: &Arc<RwLock<Config>>,
+    ui: &Option<UiBus>,
+    stream: &mut TcpStream,
+    tx: &UnboundedSender<GcpPunchEvent>,
+    dedup: &Arc<std::sync::Mutex<PunchDedup>>,
+    forward: bool,
+) -> Result<(), String> {
+    let max_events = {
+        let g = cfg.read().await;
+        g.event_pull.max_events_per_tick.max(1)
+    };
+    let tz_offset = cfg.read().await.timezone_offset_seconds;
+    let ip = {
+        let g = cfg.read().await;
+        g.punch_clock.ip.clone().unwrap_or_default()
+    };
+
+    let mut seen = 0usize;
+    loop {
+        if seen >= max_events {
+            warn!(max_events, "event pull hit per-tick cap; remaining records stay queued");
+            return Ok(());
+        }
+        let frame = encode_cmd(0x25, &[]);
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|e| format!("25H write error: {e}"))?;
+        let body = match read_frame(stream, Duration::from_secs(2)).await {
+            Ok(b) => b,
+            Err(e) if e.contains("timed out") => {
+                // Device momentarily busy / queue draining elsewhere; keep the
+                // session and retry on the next tick.
+                warn!(err = %e, "25H pull read timed out, keeping session");
+                return Ok(());
+            }
+            Err(e) => {
+                // Connection dropped (early eof / reset / abort): tear the
+                // session down so manage_session reconnects promptly instead of
+                // hammering a dead socket.
+                warn!(err = %e, "25H pull read error, closing session");
+                return Err(e);
+            }
+        };
+        match body.get(1).copied() {
+            Some(0x04) => return Ok(()), // ACK = queue empty
+            Some(0x05) => {
+                warn!("25H NACK, stopping pull");
+                return Ok(());
+            }
+            Some(_) => {}
+            None => return Ok(()),
+        }
+        seen += 1;
+
+        if forward {
+            if let Some(ev) = parse_event_reply(&body, tz_offset) {
+                forward_event(cfg, ui, tx, dedup, ev, &ip).await?;
+            }
+        }
+
+        let del = encode_cmd(0x37, &[]);
+        stream
+            .write_all(&del)
+            .await
+            .map_err(|e| format!("37H write error: {e}"))?;
+        if let Err(e) = read_frame(stream, Duration::from_secs(2)).await {
+            warn!(err = %e, "37H ack read error, keeping session");
+        }
+    }
+}
+
+/// Classifies a pulled event (time-window) and pushes it into the GCP pipeline
+/// (`tx`) and the UI as a punch.
+async fn forward_event(
+    cfg: &Arc<RwLock<Config>>,
+    ui: &Option<UiBus>,
+    tx: &UnboundedSender<GcpPunchEvent>,
+    dedup: &Arc<std::sync::Mutex<PunchDedup>>,
+    mut ev: PunchEvent,
+    ip: &str,
+) -> Result<(), String> {
+    let dup = {
+        let mut guard = dedup.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_duplicate(
+            ev.occurred_at.timestamp(),
+            &ev.uid_hex,
+            &ev.event_code,
+        )
+    };
+    if dup {
+        info!(
+            node = ev.node_id,
+            event = %ev.event_code,
+            uid = %ev.uid_hex,
+            occurred_at = %ev.occurred_at.to_rfc3339(),
+            "punch event duplicate, skipping"
+        );
+        return Ok(());
+    }
+    let (classify_enabled, windows, device, receiver_id) = {
+        let g = cfg.read().await;
+        (
+            g.classify.enabled,
+            g.classify.windows.clone(),
+            g.device.clone(),
+            g.receiver_id.clone(),
+        )
+    };
+    if classify_enabled && !windows.is_empty() {
+        ev = classify_windows(ev, &windows);
+    }
+    let received_at = Utc::now().fixed_offset();
+    let gcp = GcpPunchEvent::from_punch(&ev, &device, ip, &receiver_id, received_at);
+    tx.send(gcp).map_err(|_| "delivery worker is gone".to_string())?;
+    info!(
+        node = ev.node_id,
+        event = %ev.event_code,
+        uid = %ev.uid_hex,
+        occurred_at = %ev.occurred_at.to_rfc3339(),
+        "punch event pulled via 25H"
+    );
+    if let Some(ui) = ui {
+        ui.send(UiEvent::Punch {
+            time: ev.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            uid: ev.uid_hex.clone(),
+            event: ev.event_code.clone(),
+            ip: ip.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Parses a 25H event-log record into a `PunchEvent`. Returns `None` when the
+/// record carries no valid card UID (e.g. M24 power-on) or is malformed —
+/// those records are still deleted so the queue advances. Layout (µA event
+/// record, PRD §2.9): node func src sec min hour weekday day month year port
+/// [Data9..], with tag bytes = Data21 Data15 Data16 Data19 Data20 (big-endian).
+fn parse_event_reply(body: &[u8], tz_offset_seconds: i32) -> Option<PunchEvent> {
+    if body.len() < 24 || body.get(1).copied() == Some(0x04) {
+        return None;
+    }
+    let sec = body[3] as u32;
+    let min = body[4] as u32;
+    let hour = body[5] as u32;
+    let day = body[7] as u32;
+    let month = body[8] as u32;
+    let year = 2000 + body[9] as u32;
+    let naive = NaiveDate::from_ymd_opt(year as i32, month, day)?.and_hms_opt(hour, min, sec)?;
+    let offset = FixedOffset::east_opt(tz_offset_seconds)?;
+    let occurred_at = offset.from_local_datetime(&naive).earliest()?;
+
+    let func = body[1] as u32;
+    let node = body[0] as u32;
+    let port = body[10] as u32;
+    let door_no = Some(body[19] as u32);
+
+    let tag = ((body[23] as u64) << 32)
+        | ((body[17] as u64) << 24)
+        | ((body[18] as u64) << 16)
+        | ((body[21] as u64) << 8)
+        | (body[22] as u64);
+    if tag == 0 {
+        return None; // no scanned card -> not a punch event (e.g. power-on)
+    }
+    let uid_hex = format!("{tag:016X}");
+    let description = function_codes::lookup(func)
+        .map(|i| i.en.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let event_code = function_codes::event_code(func);
+    let raw = format!(
+        "{:02}'{:02}/{:02} {:02}:{:02}:{:02} [{:03}.{:02}:{:02X}]({}){:016X} (M{}){}",
+        body[9], month, day, hour, min, sec, node, port, func, door_no.unwrap_or(0), tag, func,
+        description
+    );
+    Some(PunchEvent {
+        node_id: node,
+        sub_code: port,
+        function_code: func,
+        event_code,
+        description,
+        door_no,
+        uid_hex,
+        uid_decimal: Some(tag),
+        username_raw: String::new(),
+        username: String::new(),
+        occurred_at,
+        punch_type: "unknown".to_string(),
+        duty_code: None,
+        duty_label: None,
+        raw,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +775,75 @@ mod tests {
         assert_eq!(r.day, 25);
         assert_eq!(r.month, 9);
         assert_eq!(r.year, 2026);
+    }
+
+    #[test]
+    fn encodes_expected_25h_frame() {
+        // frame actually used on the live device
+        let f = encode_cmd(0x25, &[]);
+        assert_eq!(f, vec![0x7E, 0x04, 0x01, 0x25, 0xDB, 0x01]);
+    }
+
+    #[test]
+    fn encodes_expected_37h_frame() {
+        // frame actually used on the live device
+        let f = encode_cmd(0x37, &[]);
+        assert_eq!(f, vec![0x7E, 0x04, 0x01, 0x37, 0xC9, 0x01]);
+    }
+
+    fn checksummed(data: &[u8]) -> Vec<u8> {
+        let mut body = data.to_vec();
+        let xor = body.iter().fold(0xFFu8, |a, &b| a ^ b);
+        let sum = (body.iter().fold(0u16, |a, &b| a + b as u16) + xor as u16) & 0xFF;
+        body.push(xor);
+        body.push(sum as u8);
+        body
+    }
+
+    #[test]
+    fn parses_25h_m03_event_with_card() {
+        // real capture 2026-09-25 19:54:06, Invalid card, UID 00000000FD6374F6,
+        // door 1: 7E 21 00 03 01 06 36 13 06 19 09 1A 11 74 F6 00 00 10 40 FD 63 01 00 74 F6
+        //           00 00 00 00 00 00 00 00 0C 37
+        let mut data = vec![0x00, 0x03, 0x01, 0x06, 0x36, 0x13, 0x06, 0x19, 0x09, 0x1A, 0x11];
+        data.extend_from_slice(&[
+            0x74, 0xF6, 0x00, 0x00, 0x10, 0x40, 0xFD, 0x63, 0x01, 0x00, 0x74, 0xF6, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let body = checksummed(&data);
+
+        let ev = parse_event_reply(&body, 28800).unwrap();
+        assert_eq!(ev.function_code, 3);
+        assert_eq!(ev.event_code, "M3");
+        assert_eq!(ev.description, "Invalid card");
+        assert_eq!(ev.uid_hex, "00000000FD6374F6");
+        assert_eq!(ev.uid_decimal, Some(0xFD63_74F6));
+        assert_eq!(ev.door_no, Some(1));
+        assert_eq!(ev.node_id, 0);
+        assert_eq!(ev.sub_code, 17);
+        assert_eq!(
+            ev.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-09-25 19:54:06"
+        );
+    }
+
+    #[test]
+    fn skips_event_without_card() {
+        // M24 power-on: tag bytes all zero -> not a punch event
+        let mut data = vec![0x00, 0x18, 0x01, 0x32, 0x22, 0x0E, 0x05, 0x15, 0x0A, 0x0A, 0x11];
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let body = checksummed(&data);
+        assert!(parse_event_reply(&body, 28800).is_none());
+    }
+
+    #[test]
+    fn ack_frame_is_empty_queue() {
+        // empty-queue ACK: 7E 0F 00 04 01 C3 46 0F 91 10 10 00 00 00 00 E1 AF
+        let data = [0x00, 0x04, 0x01, 0xC3, 0x46, 0x0F, 0x91, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00];
+        let body = checksummed(&data);
+        assert!(parse_event_reply(&body, 28800).is_none());
     }
 }

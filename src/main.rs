@@ -1,4 +1,5 @@
 mod config;
+mod dedup;
 mod forwarder;
 mod function_codes;
 mod model;
@@ -53,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     // GCP endpoint / API key) and they take effect without a restart.
     let shared = Arc::new(RwLock::new(cfg));
     let (tx, rx) = mpsc::unbounded_channel();
+    let dedup = Arc::new(std::sync::Mutex::new(dedup::PunchDedup::new(600)));
 
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let ui = UiBus::new(ui_tx);
@@ -63,7 +65,9 @@ fn main() -> anyhow::Result<()> {
         let shared = shared.clone();
         let ui = ui.clone();
         let devices = devices.clone();
-        rt.spawn(async move { server::run(shared, tx, Some(ui), devices).await })
+        let tx = tx.clone();
+        let dedup = dedup.clone();
+        rt.spawn(async move { server::run(shared, tx, Some(ui), devices, dedup).await })
     };
 
     let delivery = Arc::new(
@@ -78,13 +82,16 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Poll the card clock RTC periodically and auto-correct drift; also handles
-    // the GUI "卡鐘校時" button. Runs on the background runtime alongside the
-    // message server.
+    // the GUI "卡鐘校時" button and pulls 25H/37H punch events into the UI /
+    // delivery pipeline. Runs on the background runtime alongside the message
+    // server.
     let sync_task = {
         let shared = shared.clone();
         let ui = ui.clone();
+        let tx = tx.clone();
+        let dedup = dedup.clone();
         rt.spawn(async move {
-            if let Err(e) = ua::run_clock_sync(shared, Some(ui), sync_rx).await {
+            if let Err(e) = ua::run_clock_sync(shared, Some(ui), sync_rx, tx, dedup).await {
                 error!(err = %e, "clock sync worker exited");
             }
         })

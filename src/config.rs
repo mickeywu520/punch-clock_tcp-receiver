@@ -105,6 +105,31 @@ impl Default for ClockSyncConfig {
     }
 }
 
+/// 由 µA 25H/37H 主動拉取卡鐘事件佇列（PRD §2.9）。
+/// 卡鐘 8031 推播此機僅在重開機時出現，即時打卡須靠此通道補足。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EventPullConfig {
+    pub enabled: bool,
+    /// 輪詢週期（秒）
+    pub interval_secs: u64,
+    /// 首次連線時是否轉拋既有 backlog（false = 靜默清空，避免 2010 年舊事件進雲端）
+    pub forward_initial: bool,
+    /// 單次輪詢最多拉取筆數（防整批掃不完卡死）
+    pub max_events_per_tick: usize,
+}
+
+impl Default for EventPullConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 2,
+            forward_initial: false,
+            max_events_per_tick: 200,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClassifyConfig {
@@ -176,6 +201,7 @@ pub struct Config {
     pub classify: ClassifyConfig,
     pub gcp: GcpConfig,
     pub clock_sync: ClockSyncConfig,
+    pub event_pull: EventPullConfig,
 }
 
 impl Default for Config {
@@ -192,6 +218,7 @@ impl Default for Config {
             classify: ClassifyConfig::default(),
             gcp: GcpConfig::default(),
             clock_sync: ClockSyncConfig::default(),
+            event_pull: EventPullConfig::default(),
         }
     }
 }
@@ -250,6 +277,9 @@ fn apply_env_overrides(cfg: &mut Config) {
     }
     if let Some(v) = env_string("PUNCH_CLOCK_SYNC_ENABLED") {
         cfg.clock_sync.enabled = !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no");
+    }
+    if let Some(v) = env_string("PUNCH_EVENT_PULL_ENABLED") {
+        cfg.event_pull.enabled = !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no");
     }
 }
 
