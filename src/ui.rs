@@ -277,8 +277,17 @@ impl App {
                 Task::none()
             }
             Message::ClockSyncNow => {
-                let _ = self.clock_sync_tx.send(crate::ua::ClockSyncCmd::SyncNow);
-                self.status_line = "已送出校時指令，等待卡鐘回應…".to_string();
+                let ip = self.edit_punch_clock_ip.trim().to_string();
+                let port = self.edit_port.trim().parse().unwrap_or(1621);
+                if ip.is_empty() {
+                    self.status_line = "錯誤：請先填寫卡鐘 IP".to_string();
+                } else {
+                    let _ = self.clock_sync_tx.send(crate::ua::ClockSyncCmd::SyncNow {
+                        ip: ip.clone(),
+                        port,
+                    });
+                    self.status_line = format!("已送出校時指令到 {ip}:{port}，等待卡鐘回應…");
+                }
                 Task::none()
             }
             Message::EditPunchClockIp(s) => {

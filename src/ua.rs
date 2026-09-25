@@ -22,10 +22,10 @@ use crate::config::Config;
 use crate::ui::{UiBus, UiEvent};
 
 /// Commands the GUI can send to the clock-sync worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClockSyncCmd {
-    /// 立即以 PC 時間校準卡鐘 RTC（寫入 23H）
-    SyncNow,
+    /// 立即以 PC 時間校準卡鐘 RTC。帶 GUI 輸入框的位址,手動校時不依賴 config。
+    SyncNow { ip: String, port: u16 },
 }
 
 /// Parsed RTC reading (`24H` echo / function `0x03`).
@@ -221,12 +221,11 @@ pub async fn run_clock_sync(
         if let Some(t) = { let g = cfg.read().await; target(&g) } {
             break t;
         }
-        // no IP configured yet: wait for a manual request or retry shortly
+        // No IP in config yet: keep waiting, but manual "卡鐘校時" must still work
+        // using the address passed from the GUI input box.
         match tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv()).await {
-            Ok(Some(ClockSyncCmd::SyncNow)) => {
-                if let Some(ui) = &ui {
-                    ui.send(UiEvent::Error("尚未設定卡鐘 IP，無法校時".to_string()));
-                }
+            Ok(Some(ClockSyncCmd::SyncNow { ip, port })) => {
+                oneshot_sync(&cfg, &ui, &ip, port).await.ok();
             }
             Ok(None) => return Ok(()),
             Err(_) => {}
@@ -256,9 +255,11 @@ pub async fn run_clock_sync(
         }
         // wait with backoff, but allow a manual re-trigger to shorten the wait
         match tokio::time::timeout(Duration::from_secs(reconnect_secs), cmd_rx.recv()).await {
-            Ok(Some(ClockSyncCmd::SyncNow)) => continue,
+            Ok(Some(ClockSyncCmd::SyncNow { ip, port })) => {
+                let _ = oneshot_sync(&cfg, &ui, &ip, port).await;
+            }
             Ok(None) => return Ok(()),
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
 }
@@ -290,14 +291,23 @@ async fn manage_session(
     loop {
         let (enabled, interval) = {
             let g = cfg.read().await;
-            (
-                g.clock_sync.enabled,
-                g.clock_sync.interval_secs.max(10),
-            )
+            (g.clock_sync.enabled, g.clock_sync.interval_secs.max(10))
         };
         if !enabled {
             // auto-sync disabled: idle until a manual request arrives or config flips
-            closed_loop(cmd_rx).await?;
+            match cmd_rx.recv().await {
+                Some(ClockSyncCmd::SyncNow { ip, port }) => {
+                    match parse_addr(&ip, port) {
+                        Some(a) if a == addr => {
+                            force_sync(cfg, ui, &mut stream).await?;
+                        }
+                        _ => {
+                            oneshot_sync(cfg, ui, &ip, port).await.ok();
+                        }
+                    }
+                }
+                None => return Ok(()),
+            }
             continue;
         }
         tokio::select! {
@@ -305,18 +315,82 @@ async fn manage_session(
                 sync_once(cfg, ui, &mut stream).await?;
             }
             cmd = cmd_rx.recv() => match cmd {
-                Some(ClockSyncCmd::SyncNow) => force_sync(cfg, ui, &mut stream).await?,
+                Some(ClockSyncCmd::SyncNow { ip, port }) => {
+                    match parse_addr(&ip, port) {
+                        Some(a) if a == addr => force_sync(cfg, ui, &mut stream).await?,
+                        _ => {
+                            // manual sync to a different address: run as one-shot
+                            oneshot_sync(cfg, ui, &ip, port).await.ok();
+                        }
+                    }
+                }
                 None => return Ok(()),
             },
         }
     }
 }
 
-/// Holds the session when auto-sync is disabled; still honours manual sync.
-async fn closed_loop(cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClockSyncCmd>) -> Result<(), String> {
-    match cmd_rx.recv().await {
-        Some(ClockSyncCmd::SyncNow) => Ok(()),
-        None => Err("clock sync channel closed".to_string()),
+fn parse_addr(ip: &str, port: u16) -> Option<SocketAddr> {
+    format!("{ip}:{port}").parse().ok()
+}
+
+/// One-shot manual sync to an explicit address (independent of config / session).
+/// Reports errors to the UI itself.
+async fn oneshot_sync(
+    cfg: &Arc<RwLock<Config>>,
+    ui: &Option<UiBus>,
+    ip: &str,
+    port: u16,
+) -> Result<(), String> {
+    if ip.trim().is_empty() {
+        return Err("尚未設定卡鐘 IP".to_string());
+    }
+    let addr = match parse_addr(ip, port) {
+        Some(a) => a,
+        None => return Err(format!("無效位址 {ip}:{port}")),
+    };
+    let bcd = cfg.read().await.clock_sync.bcd_encoding;
+    let result = async {
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+            .await
+            .map_err(|_| "連線逾時".to_string())?
+            .map_err(|e| format!("連線失敗：{e}"))?;
+        stream.set_nodelay(true).ok();
+        let (now, weekday) = host_now();
+        write_rtc(&mut stream, &now, weekday, bcd).await?;
+        let shown = read_rtc(&mut stream, bcd).await.unwrap_or(RtcReading {
+            sec: now.second(),
+            min: now.minute(),
+            hour: now.hour(),
+            weekday,
+            day: now.day(),
+            month: now.month(),
+            year: now.year() as u32,
+        });
+        Ok::<_, String>((shown, now))
+    }
+    .await;
+    match result {
+        Ok((shown, now)) => {
+            info!(target = %addr, time = %now.format("%Y-%m-%d %H:%M:%S"), "manual RTC sync written");
+            if let Some(ui) = ui {
+                ui.send(UiEvent::ClockStatus {
+                    online: true,
+                    rtc: Some(shown.fmt_local()),
+                    note: Some(format!(
+                        "已手動校時 {addr}，與 PC 同步 {}",
+                        now.format("%Y-%m-%d %H:%M:%S")
+                    )),
+                });
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(ui) = ui {
+                ui.send(UiEvent::Error(format!("校時失敗：{e}")));
+            }
+            Err(e)
+        }
     }
 }
 
