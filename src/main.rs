@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("WGPU_BACKEND", "gl");
     }
 
-    let cfg_path = std::env::args().nth(1);
+    let cfg_path = resolve_cfg_path();
     let cfg = config::load(cfg_path.as_deref())?;
     init_tracing(&cfg.log_level)?;
     info!(
@@ -158,6 +158,24 @@ async fn ui_enabled_from(shared: &Arc<RwLock<Config>>) -> bool {
 async fn listen_addr_from(shared: &Arc<RwLock<Config>>) -> String {
     let g = shared.read().await;
     format!("{}:{}", g.listen.bind, g.listen.port)
+}
+
+/// 解析 config 路徑：優先第一個命令列參數；沒給則依序找 CWD 的
+/// `config.json` 與 exe 同目錄的 `config.json`，避免雙擊啟動時讀不到設定。
+fn resolve_cfg_path() -> Option<String> {
+    if let Some(p) = std::env::args().nth(1) {
+        return Some(p);
+    }
+    let mut candidates = vec![std::path::PathBuf::from("config.json")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("config.json"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn init_tracing(level: &str) -> anyhow::Result<()> {

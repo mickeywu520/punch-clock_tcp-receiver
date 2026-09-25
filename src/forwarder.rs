@@ -87,10 +87,20 @@ impl Delivery {
         if let Some(tok) = gcp.bearer_token.as_deref() {
             req = req.bearer_auth(tok);
         }
-        if let (Some(header), Some(value)) = (
-            gcp.api_key_header.as_deref(),
-            gcp.api_key_value.as_deref(),
-        ) {
+        if let Some(value) = gcp
+            .api_key_value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            // header 缺省或空白時預設 X-Api-Key（後台唯一支援的 API key header），
+            // 避免舊 UI 儲存把 api_key_header 洗回 null 導致 401。
+            let header = gcp
+                .api_key_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .unwrap_or("X-Api-Key");
             req = req.header(header, value);
         }
         let res = match req.send().await {

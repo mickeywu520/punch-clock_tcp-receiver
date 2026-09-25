@@ -502,6 +502,7 @@ async fn save_config(
     } else {
         Some(api_key.clone())
     };
+    cfg.gcp.api_key_header = Some("X-Api-Key".to_string());
     drop(cfg);
 
     // persist to disk
