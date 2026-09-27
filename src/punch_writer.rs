@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // 協定常數
@@ -32,6 +33,15 @@ pub const CMD_SET_USER: u8 = 0x84; // 新增/覆寫人員（無 APB）
 pub const CMD_SET_USER_APB: u8 = 0x83; // 同上（含 anti-pass-back）
 pub const CMD_WRITE_ALIAS: u8 = 0x2E; // 寫入姓名
 pub const CMD_READ_USER: u8 = 0x87; // 回讀人員
+pub const CMD_READ_RTC: u8 = 0x24; // 讀取時間＋韌體版本（連線暖身用）
+
+/// 是否為寫入指令的「終結」回應碼（ACK/NACK/認證/協定錯誤）。
+pub fn is_terminal(cmd: u8) -> bool {
+    matches!(
+        cmd,
+        ECHO_ACK | ECHO_NACK | ECHO_AUTH_ERR | ECHO_PROTO_ERR
+    )
+}
 
 const OP_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -284,23 +294,44 @@ pub fn build_alias_data(addr: u16, name: &str, encoding: &'static encoding_rs::E
 // ---------------------------------------------------------------------------
 
 struct Conn {
+    ip: String,
+    port: u16,
     stream: TcpStream,
     buf: Vec<u8>,
 }
 
 impl Conn {
-    async fn connect(ip: &str, port: u16) -> Result<Self, String> {
+    async fn open(ip: &str, port: u16) -> Result<Self, String> {
         let addr = format!("{ip}:{port}")
             .parse::<std::net::SocketAddr>()
             .map_err(|e| format!("無法解析 {ip}:{port}：{e}"))?;
+        debug!(%ip, port, "write: 建立 TCP 連線…");
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| format!("連線 {ip}:{port} 逾時"))?
             .map_err(|e| format!("連線 {ip}:{port} 失敗：{e}"))?;
+        debug!(%ip, port, "write: TCP 連線成功");
         Ok(Conn {
+            ip: ip.to_string(),
+            port,
             stream,
             buf: Vec::new(),
         })
+    }
+
+    /// 重連（部分機型在 87H 多筆讀取等操作後會關閉連線，需重連重試）。
+    async fn reconnect(&mut self) -> Result<(), String> {
+        debug!(ip = %self.ip, port = self.port, "write: 連線被關閉，重連…");
+        let addr = format!("{}:{}", self.ip, self.port)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("無法解析 {}:{}：{e}", self.ip, self.port))?;
+        self.stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| format!("重連 {}:{} 逾時", self.ip, self.port))?
+            .map_err(|e| format!("重連 {}:{} 失敗：{e}", self.ip, self.port))?;
+        self.buf.clear();
+        debug!(ip = %self.ip, port = self.port, "write: 重連成功");
+        Ok(())
     }
 
     async fn next_packet(&mut self, deadline: tokio::time::Instant) -> Result<Reply, String> {
@@ -329,20 +360,49 @@ impl Conn {
         }
     }
 
+    /// 送出並等待一包。連線被關閉（EOF）時自動重連並重新送出一次
+    /// （對應實機「部分機型會關掉連線」的實務，見 `tools/punch_admin.py` 掃描註記）。
     async fn request(&mut self, pkt: &[u8], timeout: Duration) -> Result<Reply, String> {
+        match self.raw_request(pkt, timeout).await {
+            Err(e) if e.contains("EOF") => {
+                warn!(ip = %self.ip, port = self.port, "write: EOF，自動重連並重送一次");
+                self.reconnect().await?;
+                self.raw_request(pkt, timeout).await
+            }
+            r => r,
+        }
+    }
+
+    async fn raw_request(&mut self, pkt: &[u8], timeout: Duration) -> Result<Reply, String> {
+        debug!(ip = %self.ip, port = self.port, hex = %hex_dbg(pkt), "write: 送出封包");
         self.stream
             .write_all(pkt)
             .await
             .map_err(|e| format!("送出封包失敗：{e}"))?;
         let deadline = tokio::time::Instant::now() + timeout;
-        self.next_packet(deadline).await
+        let r = self.next_packet(deadline).await;
+        match &r {
+            Ok(p) => debug!(ip = %self.ip, port = self.port, cmd = %format!("0x{:02X}", p.cmd), bytes = p.data.len(), "write: 收到回覆"),
+            Err(e) => warn!(ip = %self.ip, port = self.port, %e, "write: 回覆失敗"),
+        }
+        r
     }
 
     /// 寫入指令後，跳過 echo（含 0x00 / 自身 cmd），等到終結 code 才回。
-    async fn wait_ack(&mut self, timeout: Duration) -> Result<Reply, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
+    /// 連線被關閉時重連並重送原指令一次（84H/2EH 對同槽位冪等，重送安全）。
+    async fn wait_ack(&mut self, pkt: &[u8], timeout: Duration) -> Result<Reply, String> {
+        let mut retried = false;
         loop {
-            let r = self.next_packet(deadline).await?;
+            let r = match self.next_packet(tokio::time::Instant::now() + timeout).await {
+                Ok(r) => r,
+                Err(e) if e.contains("EOF") && !retried => {
+                    retried = true;
+                    self.reconnect().await?;
+                    self.raw_request(pkt, timeout).await.ok();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match r.cmd {
                 ECHO_ACK | ECHO_NACK | ECHO_AUTH_ERR | ECHO_PROTO_ERR => return Ok(r),
                 _ => continue,
@@ -355,27 +415,57 @@ impl Conn {
 // 掃描與寫入
 // ---------------------------------------------------------------------------
 
+/// 判斷 24 bytes 回讀記錄是否為「空槽」。
+///
+/// 實機（AR-821EF v5 / 4V6）對空槽的回讀是
+/// `00 00 00 00 FF FF FF FF 00 00 00 00 00 80 FF FF 4F 0C 1F 00 00 00 00 00`
+/// （UID 低 4 bytes = FF FF FF FF、mode=0x00 / zone=0x80），並非 datasheet 常見的
+/// 全 FF。故只要 UID 的最低 4 bytes 全為 FF（代表「沒有卡」）即視為空槽，
+/// 同時保留全 FF 相容。
 fn is_empty_record(rec: &[u8]) -> bool {
+    if rec.len() >= 8 {
+        // UID 低 32 bits 全 FF ＝ 沒有卡（此機空槽形狀）
+        if rec[4..8].iter().all(|&b| b == 0xFF) {
+            return true;
+        }
+    }
     rec.iter().all(|&b| b == 0xFF) || rec.iter().take(8).all(|&b| b == 0xFF)
 }
 
-/// 87H 從 `start` 找下一個空位（每次讀 20 筆，掃到 `start+MAX_AUTO_SCAN`）。
+/// 87H 多筆讀取：實機（AR-821EF v5 / 4V6）在 nums<=10 時才完整回 24 bytes/筆；
+/// 過大回應會被截斷（或部分機型直接關閉連線），故每批固定 10 筆。
+const READ_BATCH: u8 = 10;
+
+/// 87H 從 `start` 找下一個空位（每次讀一至多筆，掃到 `start+MAX_AUTO_SCAN`）。
 async fn find_free_addr(
     conn: &mut Conn,
     did: u8,
     start: u16,
 ) -> Result<u16, String> {
     let mut addr = start;
+    let mut batch: u16 = READ_BATCH as u16;
     let end = start.saturating_add(MAX_AUTO_SCAN);
     while addr < end {
         let mut data = Vec::with_capacity(3);
         data.extend_from_slice(&addr.to_be_bytes());
-        data.push(20);
+        data.push(batch as u8);
         let pkt = build_short(did, CMD_READ_USER, &data);
+        debug!(addr, batch, "write: 87H 掃描空位");
         let r = conn.request(&pkt, OP_TIMEOUT).await?;
+        debug!(addr, cmd = %format!("0x{:02X}", r.cmd), bytes = r.data.len(), "write: 87H 回覆");
         match r.cmd {
             CMD_DATA => {
+                if r.data.is_empty() {
+                    debug!(addr, "write: 87H 回覆無資料 → 此位址為空");
+                    // 沒有回傳紀錄：此位址起即為空
+                    return Ok(addr);
+                }
+                let truncated = r.data.len() % 24 != 0;
                 let recs: Vec<&[u8]> = r.data.chunks(24).collect();
+                if truncated {
+                    // 實機於 nums 過大時回應會被截斷 → 改逐筆讀取，避免取到錯誤空位或引發斷線
+                    batch = 1;
+                }
                 let free: Vec<u16> = recs
                     .iter()
                     .enumerate()
@@ -383,21 +473,36 @@ async fn find_free_addr(
                     .map(|(i, _)| addr + i as u16)
                     .collect();
                 if let Some(&f) = free.first() {
+                    info!(f, "write: 87H 找到空位");
                     return Ok(f);
                 }
-                if recs.len() < 20 {
-                    return Ok(addr + recs.len() as u16);
+                let got = recs.len() as u16;
+                if got < batch {
+                    // 回傳筆數少於要求 → 該段剩餘即為空，直接用下一格
+                    return Ok(addr + got);
                 }
-                addr = addr.saturating_add(20);
+                addr = addr.saturating_add(got);
             }
             ECHO_NACK => return Ok(addr),
             _ => {
                 // 非預期回覆（例如 0x00），跳過此段再試
-                addr = addr.saturating_add(20);
+                addr = addr.saturating_add(batch.max(1));
             }
         }
     }
     Err(format!("未找到空位人員位址（已掃描 {MAX_AUTO_SCAN} 個位址）"))
+}
+
+/// 以 24H 讀取 RTC 作為連線暖身。
+///
+/// 實機（AR-821EF v5 / 4V6）若以 87H 作為新連線的第一道指令會完全不回應
+/// （0 bytes 逾時）；先送任一無副作用指令（24H 最安全，純讀取）後，
+/// 87H 才正常回 `0x03` 資料。
+async fn warm_up(conn: &mut Conn, did: u8, timeout: Duration) -> Result<(), String> {
+    let pkt = build_short(did, CMD_READ_RTC, &[]);
+    let r = conn.request(&pkt, timeout).await?;
+    debug!(cmd = %format!("0x{:02X}", r.cmd), bytes = r.data.len(), "write: 24H 暖身回覆");
+    Ok(())
 }
 
 /// 批次寫入人員。連接一次、逐筆 84H→ACK、選填 2EH→姓名。
@@ -413,7 +518,10 @@ pub async fn add_people(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let mut conn = Conn::connect(ip, port).await?;
+    info!(ip, port, n = entries.len(), "write: 開始人員寫入");
+    let mut conn = Conn::open(ip, port).await?;
+    info!(ip, port, "write: 已連線，準備寫入");
+    warm_up(&mut conn, did, OP_TIMEOUT).await?;
     let mut next_addr: u16 = 1;
     let mut results = Vec::with_capacity(entries.len());
 
@@ -422,6 +530,7 @@ pub async fn add_people(
         let uid = match card_spec_to_uid_bytes(&ent.card_spec) {
             Ok(u) => u,
             Err(msg) => {
+                info!(addr = ent.addr.unwrap_or(0), spec = %ent.card_spec, %msg, "write: 卡號解析失敗");
                 results.push(WriteOutcome {
                     addr: ent.addr.unwrap_or(0),
                     uid_hex: ent.card_spec.clone(),
@@ -440,12 +549,13 @@ pub async fn add_people(
             None => match find_free_addr(&mut conn, did, next_addr).await {
                 Ok(a) => a,
                 Err(msg) => {
+                    info!(addr = next_addr, %msg, "write: 掃描空位失敗");
                     results.push(WriteOutcome {
-                        addr: 0,
+                        addr: next_addr,
                         uid_hex,
                         name: ent.name.clone(),
                         ok: false,
-                        detail: msg,
+                        detail: format!("掃描空位失敗（起始 位址{next_addr}）：{msg}"),
                     });
                     continue;
                 }
@@ -454,6 +564,7 @@ pub async fn add_people(
 
         // 84H 寫入單筆
         let record = build_user_record(addr, &uid, ent.mode.mode_byte());
+        info!(addr, uid = %uid_hex, "write: 84H 寫入人員");
         let mut payload = Vec::with_capacity(27);
         payload.push(1); // records count (1 byte BE)
         payload.extend_from_slice(&record);
@@ -461,8 +572,16 @@ pub async fn add_people(
 
         let mut detail = String::new();
         let mut ok = true;
+        // 實機（AR-821EF v5 / 4V6）對 84H 直接回終結碼 0x04（ACK），沒有先導 echo；
+        // 若「第一個回覆」已是終結碼就採用，不再多等一包（否則會逾時/被斷線）。
         match conn.request(&pkt, OP_TIMEOUT).await {
-            Ok(_first) => match conn.wait_ack(OP_TIMEOUT).await {
+            Ok(r) if is_terminal(r.cmd) => {
+                if r.cmd != ECHO_ACK {
+                    ok = false;
+                    detail = format!("卡鐘回應：{} (0x{:02X})", echo_name(r.cmd), r.cmd);
+                }
+            }
+            Ok(_first) => match conn.wait_ack(&pkt, OP_TIMEOUT).await {
                 Ok(r) if r.cmd == ECHO_ACK => {}
                 Ok(r) => {
                     ok = false;
@@ -487,9 +606,19 @@ pub async fn add_people(
             if let Some(name) = ent.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 match build_alias_data(addr, name, encoding_rs::BIG5) {
                     Ok(ali) => {
+                        debug!(addr, %name, "write: 2EH 寫入姓名");
                         let apkt = build_short(did, CMD_WRITE_ALIAS, &ali);
                         match conn.request(&apkt, OP_TIMEOUT).await {
-                            Ok(_) => match conn.wait_ack(OP_TIMEOUT).await {
+                            Ok(r) if is_terminal(r.cmd) => {
+                                if r.cmd != ECHO_ACK {
+                                    detail = format!(
+                                        "新增成功但姓名寫入失敗：{} (0x{:02X})",
+                                        echo_name(r.cmd),
+                                        r.cmd
+                                    )
+                                }
+                            }
+                            Ok(_) => match conn.wait_ack(&apkt, OP_TIMEOUT).await {
                                 Ok(r) if r.cmd == ECHO_ACK => {}
                                 Ok(r) => {
                                     detail = format!(
@@ -508,15 +637,17 @@ pub async fn add_people(
             }
         }
 
-        results.push(WriteOutcome {
+        let outcome = WriteOutcome {
             addr,
-            uid_hex,
+            uid_hex: uid_hex.clone(),
             name: ent.name,
             ok,
-            detail,
-        });
+            detail: detail.clone(),
+        };
+        info!(addr = outcome.addr, uid = %outcome.uid_hex, ok = outcome.ok, detail = %outcome.detail, "write: 單筆結果");
+        results.push(outcome);
     }
-
+    info!(ip, port, n = results.len(), "write: 人員寫入完成");
     Ok(results)
 }
 
@@ -530,6 +661,14 @@ pub fn echo_name(cmd: u8) -> &'static str {
         ECHO_PROTO_ERR => "協定/格式錯誤",
         _ => "未知回應",
     }
+}
+
+/// 封包十六進位字串（除錯用）。
+fn hex_dbg(b: &[u8]) -> String {
+    b.iter()
+        .map(|x| format!("{x:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +830,36 @@ mod tests {
         assert!(is_empty_record(&[0xFF; 24]));
         assert!(is_empty_record(&[0xFF; 8]));
         assert!(!is_empty_record(&[0x00; 24]));
+    }
+
+    #[test]
+    fn empty_record_detection_real_machine_shape() {
+        // 實機（AR-821EF v5 / 4V6）空槽 24B 回讀：UID 低 4 bytes 全 FF、mode=0x00/zone=0x80
+        let slot = [
+            0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0xFF, //
+            0x4F, 0x0C, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        ];
+        assert!(is_empty_record(&slot));
+        // 有卡記錄（李雅英 FD6374F6）不是空槽
+        let card = [
+            0x00, 0x00, 0x00, 0x00, 0xFD, 0x63, 0x74, 0xF6, //
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0xFF, 0xFF, //
+            0x4F, 0x0C, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        ];
+        assert!(!is_empty_record(&card));
+    }
+
+    #[test]
+    fn terminal_codes_are_ack_nack_auth_proto() {
+        // 實機 AR-821EF v5 對 84H/2EH 直接回終結碼（無先導 echo）
+        assert!(is_terminal(ECHO_ACK));
+        assert!(is_terminal(ECHO_NACK));
+        assert!(is_terminal(ECHO_AUTH_ERR));
+        assert!(is_terminal(ECHO_PROTO_ERR));
+        // 資料回覆（87H/25H/2AH 的回應）不是寫入終結碼
+        assert!(!is_terminal(CMD_DATA));
+        assert!(!is_terminal(0x00));
     }
 
     #[test]

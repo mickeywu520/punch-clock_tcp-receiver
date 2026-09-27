@@ -487,9 +487,12 @@ impl App {
                     mode: self.access_mode,
                 };
                 self.people_busy = true;
-                self.status_line = format!("正在新增人員到 {ip}:{port} …");
+                self.status_line = format!("正在經由同步引擎新增人員到 {ip}:{port} …");
+                let sync_tx = self.clock_sync_tx.clone();
                 Task::perform(
-                    async move { punch_writer::add_people(&ip, port, 1, vec![entry]).await },
+                    async move {
+                        Self::write_via_worker(&sync_tx, &ip, port, vec![entry]).await
+                    },
                     Message::AddPersonDone,
                 )
             }
@@ -513,12 +516,13 @@ impl App {
                 let ip = self.edit_punch_clock_ip.trim().to_string();
                 let port = self.edit_port.trim().parse().unwrap_or(1621);
                 self.people_busy = true;
-                self.status_line = format!("讀取 {path:?} 並批次新增 …");
+                self.status_line = format!("正在經由同步引擎讀取 {path:?} 並批次新增 …");
+                let sync_tx = self.clock_sync_tx.clone();
                 Task::perform(
                     async move {
                         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                         let entries = punch_writer::parse_csv(&bytes)?;
-                        punch_writer::add_people(&ip, port, 1, entries).await
+                        Self::write_via_worker(&sync_tx, &ip, port, entries).await
                     },
                     Message::ImportDone,
                 )
@@ -593,7 +597,30 @@ impl App {
         self.people_log.truncate(300);
     }
 
-    /// 位址欄 → `None`(留空=自動) 或合法的 `Some(addr)`
+    /// 把人員寫入委託給 clock-sync worker：worker 先釋放自己的 1621 session 再執行，
+/// 避免撞上 SOYAL 控制器「僅接受單一 master 連線」的規則（否則寫入連線會被即時斷開）。
+async fn write_via_worker(
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<crate::ua::ClockSyncCmd>,
+    ip: &str,
+    port: u16,
+    entries: Vec<punch_writer::PersonEntry>,
+) -> Result<Vec<punch_writer::WriteOutcome>, String> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    sync_tx
+        .send(crate::ua::ClockSyncCmd::WritePeople {
+            ip: ip.to_string(),
+            port,
+            entries,
+            reply,
+        })
+        .map_err(|_| "同步 worker 已結束".to_string())?;
+    tokio::time::timeout(Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| "等待卡鐘寫入回應逾時（300 秒）".to_string())?
+        .map_err(|_| "同步 worker 未回應寫入結果".to_string())?
+}
+
+/// 位址欄 → `None`(留空=自動) 或合法的 `Some(addr)`
     fn addr_from_edit(&self) -> Result<Option<u16>, String> {
         let s = self.edit_addr.trim();
         if s.is_empty() {

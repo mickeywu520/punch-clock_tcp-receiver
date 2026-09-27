@@ -33,10 +33,20 @@ use crate::server::classify_windows;
 use crate::ui::{UiBus, UiEvent};
 
 /// Commands the GUI can send to the clock-sync worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ClockSyncCmd {
-    /// 立即以 PC 時間校準卡鐘 RTC。帶 GUI 輸入框的位址,手動校時不依賴 config。
+    /// 立即以 PC 時間校準卡鐘 RTC。帶 GUI 輸入框的位址，手動校時不依賴 config。
     SyncNow { ip: String, port: u16 },
+    /// GUI 新增/匯入人員：worker 先釋放自己的 1621 session（SOYAL 只接受單一連線），
+    /// 再以一次性連線寫入；完成後把結果回傳 UI，然後恢復輪詢。
+    WritePeople {
+        ip: String,
+        port: u16,
+        entries: Vec<crate::punch_writer::PersonEntry>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<Vec<crate::punch_writer::WriteOutcome>, String>,
+        >,
+    },
 }
 
 /// Parsed RTC reading (`24H` echo / function `0x03`).
@@ -241,6 +251,9 @@ pub async fn run_clock_sync(
             Ok(Some(ClockSyncCmd::SyncNow { ip, port })) => {
                 oneshot_sync(&cfg, &ui, &ip, port).await.ok();
             }
+            Ok(Some(ClockSyncCmd::WritePeople { ip, port, entries, reply })) => {
+                write_people_oneshot(&ip, port, entries, reply).await;
+            }
             Ok(None) => return Ok(()),
             Err(_) => {}
         }
@@ -283,6 +296,9 @@ pub async fn run_clock_sync(
         match tokio::time::timeout(Duration::from_secs(reconnect_secs), cmd_rx.recv()).await {
             Ok(Some(ClockSyncCmd::SyncNow { ip, port })) => {
                 let _ = oneshot_sync(&cfg, &ui, &ip, port).await;
+            }
+            Ok(Some(ClockSyncCmd::WritePeople { ip, port, entries, reply })) => {
+                write_people_oneshot(&ip, port, entries, reply).await;
             }
             Ok(None) => return Ok(()),
             Err(_) => {}
@@ -356,6 +372,19 @@ async fn manage_session(
                         }
                     }
                 }
+                Some(ClockSyncCmd::WritePeople { ip, port, entries, reply }) => {
+                    // SOYAL 控制器只接受單一 master 連線：先釋放本session，
+                    // 讓一次性寫入連線不會被拒接/搶奪，寫完再重連恢復輪詢。
+                    info!(%ip, port, n = entries.len(), "write: worker 接手寫入，先釋放 session");
+                    drop(stream);
+                    let res = crate::punch_writer::add_people(&ip, port, 1, entries).await;
+                    info!(
+                        ok = matches!(res, Ok(_)),
+                        "write: worker 寫入結束，回傳結果給 UI",
+                    );
+                    let _ = reply.send(res);
+                    return Ok(());
+                }
                 None => return Ok(()),
             },
         }
@@ -364,6 +393,21 @@ async fn manage_session(
 
 fn parse_addr(ip: &str, port: u16) -> Option<SocketAddr> {
     format!("{ip}:{port}").parse().ok()
+}
+
+/// 一次性人員寫入（worker 沒有活躍 session 時使用；有 session 則是用
+/// `manage_session` 的 WritePeople 分支先釋放連線再寫入）。
+async fn write_people_oneshot(
+    ip: &str,
+    port: u16,
+    entries: Vec<crate::punch_writer::PersonEntry>,
+    reply: tokio::sync::oneshot::Sender<
+        Result<Vec<crate::punch_writer::WriteOutcome>, String>,
+    >,
+) {
+    info!(%ip, port, n = entries.len(), "write: worker（無 session）直接一次性寫入");
+    let res = crate::punch_writer::add_people(ip, port, 1, entries).await;
+    let _ = reply.send(res);
 }
 
 /// One-shot manual sync to an explicit address (independent of config / session).
