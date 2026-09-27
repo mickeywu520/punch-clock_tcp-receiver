@@ -295,7 +295,7 @@ datasheet 有定義、但 v1 明確**不做**的項目（避免驗收爭議；�
 |---|---|---|
 | 人員建檔 / 白名單下載 | `83H` / `84H` Set User Parameters、`2EH` 寫入姓名（User Alias）。**已實測可用**，獨立工具見 `tools/punch_admin.py` | §2.5、§2.7、§7 |
 | 人員 / 卡片刪除與查詢 | `85H` Erase user data、`87H` Get User Parameters、`86H` 重設 APB | §2.5、§7 |
-| 卡片資訊擴充欄位 | `card.user_address`、`card.user_level`、`card.site_code`、`card.card_code`、`device.port_number` | §2.6、§5.2、§7 |
+| 卡片資訊擴充欄位 | `card.user_address`、`card.user_level`、`card.site_code`、`card.card_code`、`device.port_number` | §2.6、readme §7.2、§7 |
 | 8033 推播 hosting 模式 | 機器主動推播事件的另一通道；v1 只用 8031 單向 | §2.2、§2.7 |
 | 生物特徵 / 黑名單 | `8FH` 指紋、靜脈、人臉模板；`90H` 黑名單 UID | §2.5、§7 |
 | 訪客 / 樓層 / 多門時區 | `8BH` 訪客時段、`2FH` 樓層、`89H` 多門各門時區 | §2.5 |
@@ -323,105 +323,15 @@ TCP line ─▶ parser ─▶ PunchEvent ─┬─▶ iced UI 狀態面板（來
 
 ## 5. GCP 共用 JSON Protocol（資料契約）
 
-> 版本：`gcp.punch.event.v1`（JSON Schema + 範例如下）。任何欄位新增採向後相容（optional），不可刪除既有欄位。
+> ⚠️ **已統整（2026-09-27）**：完整欄位定義、單筆／批次範例、傳輸與認證、回應格式（200 + per-item `status`）、冪等／重試／spool 契約，
+> 一律以 [readme.md §7「GCP JSON Protocol」](readme.md) 為**唯一權威版本**；`POST /api/v1/punch-events` 實際請求／回應格式與後台三個端點一覽見 readme §8。
 
-### 5.1 單筆事件物件（`GcpPunchEvent`）
-
-```json
-{
-  "schema_version": "v1",
-  "event_id": "3f0b6a1e-9c42-4d5e-8b01-2a1c3d4e5f60",
-  "message_type": "punch_event",
-  "occurred_at": "2021-05-12T13:38:54+08:00",
-  "received_at": "2026-09-19T10:12:00+08:00",
-  "device": {
-    "maker": "SOYAL",
-    "model": "AR837EF",
-    "node_id": 1,
-    "ip": "192.168.1.28",
-    "source_sub_code": 17
-  },
-  "event": {
-    "function_code": 11,
-    "event_code": "M11",
-    "description": "Normal Access by tag",
-    "door_no": 0
-  },
-  "card": {
-    "uid_hex": "00000000D4B81403",
-    "uid_decimal": 356701004291,
-    "card_number_hi": 54456,
-    "card_number_lo": 5123
-  },
-  "person": {
-    "alias": "Sammi",
-    "user_id": null
-  },
-  "punch": {
-    "punch_type": "check_in",
-    "duty_code": null,
-    "duty_label": null
-  },
-  "ingested_by": {
-    "receiver_id": "punch-clock-01"
-  },
-  "raw_message": "21'05/12 13:38:54 [001.17:0B](0)00000000D4B81403 rSammi (M11)Normal Access"
-}
-```
-
-### 5.2 欄位定義
-
-> 上例為 **v1 實作之實際輸出**。下表標註「v1 未產生」者為向後相容之**預留 optional 欄位**，雲端 parser 必須容忍缺欄位（不視為錯誤）。
-
-| 欄位 | 型別 | 必填 | 說明 |
-|---|---|---|---|
-| `schema_version` | string | 是 | 固定 `v1` |
-| `event_id` | string (uuid) | 是 | 接收端產生之唯一 ID（冪等識別） |
-| `message_type` | string | 是 | 固定 `punch_event` |
-| `occurred_at` | string ISO8601 | 是 | 機端刷卡時間＋設備時區偏移 |
-| `received_at` | string ISO8601 | 是 | 接收端時間 |
-| `device.maker` | string | 是 | 固定 `SOYAL` |
-| `device.model` | string | 是 | 設備型號，由設定提供 |
-| `device.node_id` | int | 是 | 機端 Node ID（`[001...]`） |
-| `device.ip` | string | 是 | 連線來源 IP |
-| `device.source_sub_code` | int | 是 | TEXT `[ ]` 中間欄＝**Port Number**（`881E §4.1 Data 8`：17 主埠、18 WG1、19 WG2、1~16 多門子機）。※ 欄位名沿用 v1 實作（`src/model.rs`），語意化別名見下一列，**不刪除本欄位** |
-| `device.port_number` | int\|null | 否 | 與 `device.source_sub_code` 同值之語意化別名（Port Number）。**v1.6 已產生** |
-| `event.function_code` | int | 是 | 十進位事件碼（M 碼數值） |
-| `event.event_code` | string | 是 | `M{code}` |
-| `event.description` | string | 是 | 事件描述（機端提供者優先，缺省用內建對照表） |
-| `event.door_no` | int\|null | 否 | `( )` 內之門號 |
-| `card.uid_hex` | string | 是 | 8 bytes Tag UID HEX（大端呈現 16 碼）；bit31~16 = **Site Code**、bit15~0 = **Card Code**（§2.6） |
-| `card.uid_decimal` | int\|null | 否 | HEX 之 u64 十進位 |
-| `card.card_number_hi` | int\|null | 否 | Tag UID bit31~16（＝**Site Code**，十進位） |
-| `card.card_number_lo` | int\|null | 否 | Tag UID bit15~0（＝**Card Code**，十進位） |
-| `card.site_code` | int\|null | 否 | `card_number_hi` 之語意化別名。**v1.6 已產生** |
-| `card.card_code` | int\|null | 否 | `card_number_lo` 之語意化別名。**v1.6 已產生** |
-| `card.user_address` | int\|null | 否 | 機端人員索引（`881E §4.1 Data 9/10`；無效卡片事件時為 Tag ID bit15~08/07~00）。**TEXT 模式一律 null**，需 8033 HEX；**v1 未產生** |
-| `card.user_level` | int\|null | 否 | 使用者等級（`Data 14`）。**TEXT 模式一律 null**；**v1 未產生** |
-| `person.alias` | string\|null | 否 | 用戶別名（機端下載之姓名） |
-| `person.user_id` | string\|int\|null | 否 | 雲端映射之學生學號（由 GCP 側填補） |
-| `punch.punch_type` | string | 是 | `check_in`\|`check_out`\|`unknown`（由時間窗分類） |
-| `punch.duty_code` | int\|null | 否 | Duty code（Sub Code bit7~5，0~7）。⚠️ **v1（8031 TEXT）一律為 `null`**：Duty code 位於事件封包 Data 11 `Sub Code`，TEXT 行內無此欄位（見附錄 B） |
-| `punch.duty_label` | string\|null | 否 | Duty 文字（On Duty/Off Duty…）。同上，**v1 一律 `null`** |
-| `ingested_by.receiver_id` | string | 是 | 接收端實例名稱 |
-| `raw_message` | string | 是 | 原始接收行（保留稽核） |
-
-### 5.3 傳輸方式（GCP 端實作建議）
-
-Transport 二選一：
-
-1. **HTTPS（本 v1 實作）**：POST `application/json`，Body 為單筆物件或批次陣列：
-   - 單筆：`{"events": [ GcpPunchEvent ]}`（batch disabled 時）
-   - 批次：`{"events": [ GcpPunchEvent, ... ]}`（batch enabled 時，上限 `batch_max_items`）
-   - 驗證：`Authorization: Bearer <token>` 或 `X-Api-Key`（可設定）。
-   - GCP 推薦架構：Cloud Run（或 API Gateway）→ Pub/Sub → Dataflow/BigQuery。
-
-2. **Pub/Sub（後續版本）**：接收端以 `google-cloud-pubsub` publish 到 topic；可作為無 HTTP endpoint 時的替代。
-
-### 5.4 錯誤與冪等
-- **冪等**：GCP 側以 `event_id` 去重（重送不重複入帳）。
-- **重試**：接收端對 5xx/timeout 指數退避（預設最多 5 次）；最終失敗落 `spool/`。
-- **格式錯誤（400/422）**：記錄為 metering 錯誤並落 spool，供 Debug。
+- Schema 版本：`gcp.punch.event.v1`；任何欄位新增採向後相容（optional），不可刪除既有欄位。
+- v1 於 TEXT 模式無法取得、一律 `null` 之欄位：`card.user_address`、`card.user_level`、`punch.duty_code`、`punch.duty_label`
+  （Duty code 位於事件封包 Data 11 `Sub Code` 之 bit7~5，TEXT 行內無此欄位，見附錄 B）。
+- 語意化別名 `device.port_number`、`card.site_code`、`card.card_code` 自 **v1.6** 送出（＝`source_sub_code`／`card_number_hi`／`card_number_lo`）。
+- 冪等鍵 `event_id`（UUID v4）：重試／spool 重送沿用同一 id；後台回 `duplicate` 不重複計次。
+- 後台端點一律回 HTTP 200 + per-item `status`（`ok`/`duplicate`/`unknown_card`/`inactive`/`error`），**永不回 4xx（除 429）**；4xx（非 429）視為永久失敗不重送、不撤 spool。
 
 ---
 
@@ -487,7 +397,7 @@ Transport 二選一：
   建議在 receiver 去除前綴後再上送，或在 GCP parser 正規化。中文別名編碼（Big5？）尚未實機驗證
   （見上「串接前提」）。
 - `card.site_code` / `card.card_code`：名冊建立已可用工具 `--uid site:card` 匯入（§2.6、§2.7）；
-  GCP 端對應欄位已在 §5.2 預留，**v1.6 起 `src/model.rs` 已同步輸出**
+  GCP 端對應欄位已在 readme §7.2 定義，**v1.6 起 `src/model.rs` 已同步輸出**
   `card.site_code`（＝`card_number_hi`）與 `card.card_code`（＝`card_number_lo`），
   `card.card_number_hi` / `card.card_number_lo` 仍保留以向後相容。
 - 名冊建立路徑（v1.3 實測可行）：`punch_admin.py add-user --addr N --uid site:card --name 姓名 --yes`
@@ -501,7 +411,7 @@ Transport 二選一：
 3. 停掉 GCP endpoint 20 秒再啟動，期間所有刷卡記錄最後仍全數送達（spool 補送）且以 `event_id` 去重。
 4. 打卡機重新開機或拔插網路後自動重連，無需重啟 receiver。
 5. RFC3339 校時：`occurred_at` 屬正確設備時區（+08:00 範例）。
-6. 未知 / 未涵蓋事件碼不得中斷服務：記錄 warning 後照常上送（`event_code` 保留原始 M 碼）；且 GCP 端可容忍 §5.2 標註「v1 未產生」之 optional 欄位缺漏。
+6. 未知 / 未涵蓋事件碼不得中斷服務：記錄 warning 後照常上送（`event_code` 保留原始 M 碼）；且 GCP 端可容忍 readme §7.2 標註「v1 未產生」之 optional 欄位缺漏。
 7. **機端 RTC 需先校時**：實測機端時間為 `2010-11-09`（未校時），校時後 `occurred_at` 須與實際刷卡時間一致（誤差 ≤1 秒），否則不得視為通過（可用 `23H` 或機端網頁校時）。
 8. **GUI 施工流程（FR-10）**：無參數啟動 receiver 後出現 iced 視窗並大字顯示本機 IPv4。施工人員依畫面將打卡機後台 `Message Server IP 1st` 填上顯示之 IP、`Message Port 1st` 填 `8031` 並儲存（後台預設 `0.0.0.0`／`0`＝關閉）；刷卡後 **UI 即時列出該事件**，且 GCP ≤1 秒內收到（與第 1 項一致）。
 9. **UI 顯示準確（FR-11）**：UI 所列 IP 與本機實際介面 IP（`ipconfig`）一致，且**不得顯示 `0.0.0.0`**；打卡機與 receiver 同網段（或可路由）時能連上並推送。
