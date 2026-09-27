@@ -4,7 +4,9 @@ mod forwarder;
 mod function_codes;
 mod model;
 mod parser;
+mod punch_writer;
 mod server;
+mod tray;
 mod ua;
 mod ui;
 
@@ -29,6 +31,14 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     if std::env::var_os("WGPU_BACKEND").is_none() {
         std::env::set_var("WGPU_BACKEND", "gl");
+    }
+
+    if !ensure_single_instance() {
+        // 同時只允許一個接收程式實例，否則併發實例會互搶 1621/8031 埠
+        // 並造成重複刷卡事件。
+        #[cfg(target_os = "windows")]
+        show_blocked_message();
+        std::process::exit(1);
     }
 
     let cfg_path = resolve_cfg_path();
@@ -145,6 +155,56 @@ fn main() -> anyhow::Result<()> {
     });
     info!("shutdown complete");
     Ok(())
+}
+
+/// Windows named mutex 單一實例鎖：回 `true` 表示目前是唯一實例。
+///
+/// 持鎖 handle 故意留在 process 生命週期（`mem::forget`），否則函式結束時
+/// release 掉鎖就又會允許第二個實例啟動。
+fn ensure_single_instance() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let name: Vec<u16> = "Local\\punch-clock-tcp-receiver"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            // 建立失敗時放行，避免誤擋正常啟動
+            return true;
+        }
+        std::mem::forget(Box::new(handle));
+        return unsafe { GetLastError() != ERROR_ALREADY_EXISTS };
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
+/// 第二實例被擋下時顯示給使用者看的訊息視窗。
+#[cfg(target_os = "windows")]
+fn show_blocked_message() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+    let text: Vec<u16> = "打卡機中轉程式已在執行中（工作匣亦有圖示）。\n請勿重複開啟。"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let title: Vec<u16> = "打卡機中轉程式"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
 }
 
 async fn spool_dir_from(shared: &Arc<RwLock<Config>>) -> std::path::PathBuf {

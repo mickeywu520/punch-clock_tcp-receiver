@@ -15,10 +15,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iced::widget::{button, column, row, text, text_input};
+use iced::widget::{button, column, pick_list, row, scrollable, text, text_input};
+use iced::window;
 use iced::{Alignment, Element, Font, Length, Size, Subscription, Task, Theme};
 
 use crate::config::Config;
+use crate::punch_writer;
+use crate::tray;
 
 // ---------------------------------------------------------------------------
 // Event bus: tokio runtime (server/delivery) -> UI thread
@@ -137,7 +140,32 @@ pub enum Message {
     TestConnect,
     TestResult(Result<String, String>),
     ClockSyncNow,
+    // 工作匣（tray）
+    WindowEvent((window::Id, window::Event)),
+    // 頁籤與人員管理
+    TabSelected(Tab),
+    EditCard(String),
+    EditName(String),
+    EditAddr(String),
+    AccessModeSelected(String),
+    AddPerson,
+    AddPersonDone(Result<Vec<punch_writer::WriteOutcome>, String>),
+    ImportCsv,
+    ImportFileChosen(Option<PathBuf>),
+    ImportDone(Result<Vec<punch_writer::WriteOutcome>, String>),
 }
+
+/// 頂部頁籤
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    #[default]
+    Monitor,
+    People,
+    Settings,
+}
+
+/// 通行模式下拉選項（順序與 `punch_writer::AccessMode` 對應）
+const MODE_OPTIONS: [&str; 3] = ["卡片驗證", "卡片或密碼", "卡片+密碼"];
 
 struct App {
     external: Arc<tokio::sync::RwLock<Config>>,
@@ -160,6 +188,20 @@ struct App {
     gcp_status: Option<(bool, String)>,
     clock_online: bool,
     clock_rtc: String,
+
+    // 頁籤與人員管理
+    tab: Tab,
+    edit_card: String,
+    edit_name: String,
+    edit_addr: String,
+    access_mode: punch_writer::AccessMode,
+    people_log: Vec<String>,
+    people_busy: bool,
+
+    // 工作匣／單一視窗
+    tray: Option<tray::TrayHandle>,
+    window_id: Option<window::Id>,
+    force_quit: bool,
 }
 
 pub fn run(flags: Flags) -> iced::Result {
@@ -179,6 +221,9 @@ pub fn run(flags: Flags) -> iced::Result {
         .title("打卡機中轉程式 (Punch Clock Receiver)")
         .subscription(App::subscription)
         .theme(Theme::Dark)
+        // 方案 A：不讓 X 直接關閉程式，改由 `window::Event::CloseRequested`
+        // 收進工作匣（tray）；真正離開走 tray 選單「離開程式」→ `window::close`
+        .exit_on_close_request(false)
         .default_font(default_font())
         .window_size(Size::new(780.0, 700.0))
         .resizable(true)
@@ -201,7 +246,7 @@ fn default_font() -> Font {
 impl App {
     fn new(flags: Flags) -> Self {
         let local_ips = local_ipv4();
-        App {
+        let mut app = App {
             external: flags.config,
             cfg_path: flags.cfg_path,
             rx: flags.ui_rx,
@@ -228,7 +273,25 @@ impl App {
             gcp_status: None,
             clock_online: false,
             clock_rtc: "－".to_string(),
+            tab: Tab::default(),
+            edit_card: String::new(),
+            edit_name: String::new(),
+            edit_addr: String::new(),
+            access_mode: punch_writer::AccessMode::default(),
+            people_log: Vec::new(),
+            people_busy: false,
+            tray: None,
+            window_id: None,
+            force_quit: false,
+        };
+        // 工作匣圖示必須在有 win32 message pump 的執行緒建立（= iced 主執行緒）。
+        match tray::build_tray() {
+            Ok(t) => app.tray = Some(t),
+            Err(e) => {
+                app.status_line = format!("警告：工作匣啟動失敗（{e}），仍可使用視窗操作。")
+            }
         }
+        app
     }
 
     fn drain_events(&mut self) -> Task<Message> {
@@ -242,7 +305,13 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.drain_events(),
+            Message::Tick => {
+                let mut task = self.drain_events();
+                if let Some(cmd) = tray::poll_tray() {
+                    task = task.chain(self.handle_tray(cmd));
+                }
+                task
+            }
             Message::Ui(ev) => {
                 match ev {
                     UiEvent::DeviceConnected(ip) => {
@@ -346,14 +415,245 @@ impl App {
                 });
                 Task::none()
             }
+            // -- 工作匣 --
+            Message::WindowEvent((id, ev)) => match ev {
+                window::Event::Opened { .. } => {
+                    self.window_id = Some(id);
+                    Task::none()
+                }
+                window::Event::CloseRequested => {
+                    self.window_id = Some(id);
+                    if self.force_quit {
+                        // 已是 tray「離開程式」流程，直接放行關閉
+                        window::close(id)
+                    } else {
+                        self.status_line =
+                            "已收進工作匣：程式持續接收刷卡。可由工作匣圖示叫回主視窗。"
+                                .to_string();
+                        window::set_mode(id, window::Mode::Hidden)
+                    }
+                }
+                _ => Task::none(),
+            },
+            // -- 頁籤 --
+            Message::TabSelected(tab) => {
+                self.tab = tab;
+                Task::none()
+            }
+            // -- 人員管理 --
+            Message::EditCard(s) => {
+                self.edit_card = s;
+                Task::none()
+            }
+            Message::EditName(s) => {
+                self.edit_name = s;
+                Task::none()
+            }
+            Message::EditAddr(s) => {
+                self.edit_addr = s;
+                Task::none()
+            }
+            Message::AccessModeSelected(label) => {
+                self.access_mode = punch_writer::AccessMode::from_label(&label);
+                Task::none()
+            }
+            Message::AddPerson => {
+                let ip = self.edit_punch_clock_ip.trim().to_string();
+                if ip.is_empty() {
+                    self.status_line = "錯誤：請先在「設定」填寫卡鐘 IP".to_string();
+                    return Task::none();
+                }
+                let port = self.edit_port.trim().parse().unwrap_or(1621);
+                let card = self.edit_card.trim().to_string();
+                if card.is_empty() {
+                    self.status_line = "錯誤：請填卡片號".to_string();
+                    return Task::none();
+                }
+                let addr = match self.addr_from_edit() {
+                    Ok(a) => a,
+                    Err(msg) => {
+                        self.status_line = msg;
+                        return Task::none();
+                    }
+                };
+                let entry = punch_writer::PersonEntry {
+                    card_spec: card,
+                    name: if self.edit_name.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.edit_name.trim().to_string())
+                    },
+                    addr,
+                    mode: self.access_mode,
+                };
+                self.people_busy = true;
+                self.status_line = format!("正在新增人員到 {ip}:{port} …");
+                Task::perform(
+                    async move { punch_writer::add_people(&ip, port, 1, vec![entry]).await },
+                    Message::AddPersonDone,
+                )
+            }
+            Message::AddPersonDone(res) => {
+                self.people_busy = false;
+                self.apply_write_results(res);
+                Task::none()
+            }
+            Message::ImportCsv => Task::perform(
+                async move {
+                    let file = rfd::AsyncFileDialog::new()
+                        .set_title("選擇批次匯入 CSV（一行一人）")
+                        .add_filter("CSV / 文字檔", &["csv", "txt"])
+                        .pick_file()
+                        .await;
+                    file.map(|f| f.path().to_path_buf())
+                },
+                Message::ImportFileChosen,
+            ),
+            Message::ImportFileChosen(Some(path)) => {
+                let ip = self.edit_punch_clock_ip.trim().to_string();
+                let port = self.edit_port.trim().parse().unwrap_or(1621);
+                self.people_busy = true;
+                self.status_line = format!("讀取 {path:?} 並批次新增 …");
+                Task::perform(
+                    async move {
+                        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                        let entries = punch_writer::parse_csv(&bytes)?;
+                        punch_writer::add_people(&ip, port, 1, entries).await
+                    },
+                    Message::ImportDone,
+                )
+            }
+            Message::ImportFileChosen(None) => {
+                self.status_line = "已取消匯入".to_string();
+                Task::none()
+            }
+            Message::ImportDone(res) => {
+                self.people_busy = false;
+                self.apply_write_results(res);
+                Task::none()
+            }
+        }
+    }
+
+    /// tray 選單指令 → 視窗動作
+    fn handle_tray(&mut self, cmd: tray::TrayCmd) -> Task<Message> {
+        match cmd {
+            tray::TrayCmd::Show => match self.window_id {
+                Some(id) => {
+                    self.status_line = "已顯示主視窗。".to_string();
+                    window::set_mode(id, window::Mode::Windowed)
+                        .chain(window::gain_focus(id))
+                }
+                None => Task::none(),
+            },
+            tray::TrayCmd::Quit => {
+                self.force_quit = true;
+                match self.window_id {
+                    Some(id) => window::close(id),
+                    None => Task::none(),
+                }
+            }
+        }
+    }
+
+    /// 把一次寫入的結果推到紀錄清單與狀態列
+    fn apply_write_results(&mut self, res: Result<Vec<punch_writer::WriteOutcome>, String>) {
+        match res {
+            Ok(outcomes) => {
+                let mut ok = 0usize;
+                let mut fail = 0usize;
+                let mut lines = Vec::new();
+                for o in &outcomes {
+                    if o.ok {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                    let name = o.name.as_deref().unwrap_or("（無姓名）");
+                    lines.push(if o.ok {
+                        format!("位址 {}  UID {}  {}  ✓ 成功", o.addr, o.uid_hex, name)
+                    } else {
+                        format!("位址 {}  UID {}  {}  ✗ 失敗：{}", o.addr, o.uid_hex, name, o.detail)
+                    });
+                }
+                for line in lines {
+                    self.push_people_log(line);
+                }
+                self.status_line = format!("寫入完成：成功 {ok} 筆 / 失敗 {fail} 筆");
+            }
+            Err(msg) => {
+                self.status_line = format!("寫入失敗：{msg}");
+                self.push_people_log(format!("✗ 寫入失敗：{msg}"));
+            }
+        }
+    }
+
+    fn push_people_log(&mut self, line: String) {
+        self.people_log.insert(0, line);
+        self.people_log.truncate(300);
+    }
+
+    /// 位址欄 → `None`(留空=自動) 或合法的 `Some(addr)`
+    fn addr_from_edit(&self) -> Result<Option<u16>, String> {
+        let s = self.edit_addr.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        match s.parse::<u16>() {
+            Ok(a) => Ok(Some(a)),
+            Err(_) => Err(format!("錯誤：人員位址需為 1~65535 的數字，收到 {s:?}")),
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(300)).map(|_| Message::Tick)
+        let tick = iced::time::every(Duration::from_millis(300)).map(|_| Message::Tick);
+        let win_events = window::events().map(|(id, ev)| Message::WindowEvent((id, ev)));
+        Subscription::batch([tick, win_events])
     }
 
     fn view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
+        let header = row![
+            column![
+                text("打卡機中轉程式").size(22),
+                text("等待卡鐘連線 → 轉拋到 GCP").size(14),
+            ]
+            .spacing(4),
+            text("關閉視窗＝收進工作匣").size(12),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(16);
+
+        let tab_bar = row![
+            self.tab_button("監控", Tab::Monitor),
+            self.tab_button("人員管理", Tab::People),
+            self.tab_button("設定", Tab::Settings),
+        ]
+        .spacing(8);
+
+        let content = match self.tab {
+            Tab::Monitor => self.monitor_view(),
+            Tab::People => self.people_view(),
+            Tab::Settings => self.settings_view(),
+        };
+
+        column![header, tab_bar, content]
+            .spacing(12)
+            .padding(16)
+            .into()
+    }
+
+    fn tab_button(&self, label: &'static str, tab: Tab) -> Element<'_, Message, Theme, iced::Renderer> {
+        let selected = self.tab == tab;
+        let btn = button(text(label)).on_press(Message::TabSelected(tab));
+        if selected {
+            btn.style(button::primary).into()
+        } else {
+            btn.style(button::secondary).into()
+        }
+    }
+
+    /// 監控頁：本機 IP／卡鐘狀態／最近刷卡
+    fn monitor_view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
         let local_ips = self.local_ips.iter().fold(
             column![].push(text("本機 IPv4（填入卡鐘後台 Message Server IP 1st）：").size(16)),
             |col, ip| col.push(text(ip.clone()).size(28)),
@@ -386,7 +686,108 @@ impl App {
             None => "尚未送出任何事件".to_string(),
         };
 
-        // Settings panel
+        let status = column![
+            text(&self.status_line).size(14),
+            text(format!("卡鐘 RTC：{}", self.clock_rtc)).size(13),
+            text(format!("監聽：{}", self.listen_addr)).size(13),
+            text(format!("已連線卡鐘：{connected}")).size(13),
+            text(gcp_line).size(13),
+        ]
+        .spacing(4);
+
+        let event_rows = self.last_events.iter().fold(
+            column![],
+            |col, (time, uid, event, ip)| {
+                col.push(text(format!("{time}  {uid}  {event}  來自 {ip}")).size(13))
+            },
+        );
+        let events = column![
+            text("最近刷卡").size(18),
+            if self.last_events.is_empty() {
+                column![text("（尚無）")].push(text(""))
+            } else {
+                event_rows
+            },
+        ]
+        .spacing(4);
+
+        column![local_ips, status, events]
+            .spacing(12)
+            .into()
+    }
+
+    /// 人員管理頁：單筆新增＋批次匯入＋寫入紀錄
+    fn people_view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
+        let form = column![
+            text("新增人員").size(18),
+            row![
+                text("卡號    "),
+                text_input("64867:29942 或 16碼HEX", &self.edit_card)
+                    .on_input(Message::EditCard)
+                    .width(Length::Fixed(260.0)),
+            ]
+            .spacing(8),
+            row![
+                text("姓名    "),
+                text_input("選填，寫入卡鐘姓名（Big5，至多 8 字）", &self.edit_name)
+                    .on_input(Message::EditName)
+                    .width(Length::Fixed(260.0)),
+            ]
+            .spacing(8),
+            row![
+                text("位址    "),
+                text_input("留空＝自動找下一個空位", &self.edit_addr)
+                    .on_input(Message::EditAddr)
+                    .width(Length::Fixed(120.0)),
+            ]
+            .spacing(8),
+            row![
+                text("通行模式"),
+                pick_list(MODE_OPTIONS, Some(self.access_mode.label()), |s| {
+                    Message::AccessModeSelected(s.to_string())
+                })
+                .width(Length::Shrink),
+            ]
+            .spacing(8),
+            row![
+                button("新增人員").on_press(Message::AddPerson),
+                button("匯入 CSV（批次新增）").on_press(Message::ImportCsv),
+                if self.people_busy {
+                    text("處理中…").size(13)
+                } else {
+                    text("").size(13)
+                },
+            ]
+            .spacing(8),
+            text("批次匯入格式：每行 ─ 卡號,姓名（姓名可省略）；卡號為 `site:card` 或 16碼 HEX；檔案支援 UTF-8 / Big5")
+                .size(12),
+        ]
+        .spacing(8);
+
+        let log_rows = self
+            .people_log
+            .iter()
+            .fold(column![].spacing(2), |col, line| {
+                col.push(text(line).size(13))
+            });
+        let log_area = scrollable(
+            column![
+                text("寫入紀錄").size(18),
+                if self.people_log.is_empty() {
+                    column![text("（尚無）").size(13)]
+                } else {
+                    log_rows
+                },
+            ]
+            .spacing(4),
+        )
+        .height(Length::Fill);
+
+        column![form, log_area].spacing(12).into()
+    }
+
+    /// 設定頁：卡鐘與 GCP 設定
+    fn settings_view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
         let settings = column![
             text("卡鐘設定").size(18),
             row![
@@ -426,50 +827,13 @@ impl App {
         ]
         .spacing(8);
 
-        let status = column![
-            text(&self.status_line).size(14),
-            text(format!("卡鐘 RTC：{}", self.clock_rtc)).size(13),
-            text(format!("監聽：{}", self.listen_addr)).size(13),
-            text(format!("已連線卡鐘：{connected}")).size(13),
-            text(gcp_line).size(13),
-        ]
-        .spacing(4);
-
-        // Recent events
-        let event_rows = self.last_events.iter().fold(
-            column![],
-            |col, (time, uid, event, ip)| {
-                col.push(text(format!("{time}  {uid}  {event}  來自 {ip}")).size(13))
-            },
-        );
-        let events = column![
-            text("最近刷卡").size(18),
-            if self.last_events.is_empty() {
-                column![text("（尚無）")].push(text(""))
-            } else {
-                event_rows
-            },
-        ]
-        .spacing(4);
-
         column![
-            row![
-                column![
-                    text("打卡機中轉程式").size(22),
-                    text("等待卡鐘連線 → 轉拋到 GCP").size(14),
-                ]
-                .spacing(4)
-                .width(Length::Fill),
-                settings.width(Length::Shrink),
-            ]
-            .align_y(Alignment::Start)
-            .spacing(24),
-            local_ips,
-            status,
-            events,
+            text(&self.status_line).size(14),
+            settings,
+            text("在「人員管理」新增的人員是直接寫入卡鐘（84H 新增 + 2EH 姓名）。")
+                .size(12),
         ]
         .spacing(12)
-        .padding(16)
         .into()
     }
 }
