@@ -22,6 +22,7 @@ use iced::{Alignment, Element, Font, Length, Size, Subscription, Task, Theme};
 use crate::config::Config;
 use crate::punch_writer;
 use crate::tray;
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Event bus: tokio runtime (server/delivery) -> UI thread
@@ -556,11 +557,12 @@ impl App {
                 None => Task::none(),
             },
             tray::TrayCmd::Quit => {
-                self.force_quit = true;
-                match self.window_id {
-                    Some(id) => window::close(id),
-                    None => Task::none(),
-                }
+                // 直接終結行程：iced 在 `exit_on_close_request(false)` 下
+                // `window::close` 不會結束 run loop，整個程序會留在背景，
+                // 屆時重啟會被單一實例鎖擋住。`process::exit` 會立即釋放
+                // 所有資源（含 16x1/1621 連線與單一實例鎖）。
+                info!("user requested quit via tray menu");
+                std::process::exit(0);
             }
         }
     }

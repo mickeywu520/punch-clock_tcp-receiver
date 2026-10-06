@@ -64,13 +64,15 @@ pub fn build_tray() -> Result<TrayHandle, String> {
     Ok(())
 }
 
-/// 程式碼內建的 32x32 時鐘圖示（RGBA，白底淺灰／透明背景）。
+/// 程式碼內建的 32x32 時鐘圖示（RGBA）。原本用白色，在淺色工作列上會「隱形」，
+/// 改為深藍（IKB/DeepBlue，RGB 0,70,153）：淺色與深色工作列都能清楚看見。
 #[cfg(target_os = "windows")]
 fn tray_icon_bytes() -> Vec<u8> {
     const SIZE: usize = 32;
     const CX: i32 = 15;
     const CY: i32 = 16;
     const R: i32 = 12;
+    const RGB: [u8; 3] = [0x00, 0x46, 0x99];
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -83,9 +85,9 @@ fn tray_icon_bytes() -> Vec<u8> {
             let on = ring || hand_min || hand_hour;
             if on {
                 let i = (y * SIZE + x) * 4;
-                rgba[i] = 255;
-                rgba[i + 1] = 255;
-                rgba[i + 2] = 255;
+                rgba[i] = RGB[0];
+                rgba[i + 1] = RGB[1];
+                rgba[i + 2] = RGB[2];
                 rgba[i + 3] = 255;
             }
         }
