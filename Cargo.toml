@@ -1,6 +1,6 @@
 [package]
 name = "punch-clock-tcp-receiver"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "SOYAL AR837EF punch clock TCP receiver that parses active-message events and forwards normalized JSON to GCP"
 license = "MIT"

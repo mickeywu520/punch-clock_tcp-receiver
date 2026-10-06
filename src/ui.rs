@@ -232,6 +232,11 @@ pub fn run(flags: Flags) -> iced::Result {
 
 /// The Traditional-Chinese font bundled with Windows. System fonts are loaded
 /// automatically by iced 0.14, so this family always resolves on Windows.
+/// 目前安裝的程式版本（顯示於 UI 標題，追蹤客戶端版本用）。
+fn current_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
 fn default_font() -> Font {
     #[cfg(target_os = "windows")]
     {
@@ -663,7 +668,13 @@ async fn write_via_worker(
             Tab::Settings => self.settings_view(),
         };
 
-        column![header, tab_bar, content]
+        let footer = row![
+            text("").width(Length::Fill),
+            text(current_version()).size(12),
+        ]
+        .align_y(Alignment::Center);
+
+        column![header, tab_bar, content, footer]
             .spacing(12)
             .padding(16)
             .into()
