@@ -154,6 +154,11 @@ pub enum Message {
     ImportCsv,
     ImportFileChosen(Option<PathBuf>),
     ImportDone(Result<Vec<punch_writer::WriteOutcome>, String>),
+    // 取得卡鐘已註冊人員 → 匯出 CSV
+    ExportUsers,
+    ExportUsersResult(Result<Vec<punch_writer::ReadUser>, String>),
+    ExportPathChosen(Option<PathBuf>),
+    ExportDone(Result<(PathBuf, usize), String>),
 }
 
 /// 頂部頁籤
@@ -198,6 +203,7 @@ struct App {
     access_mode: punch_writer::AccessMode,
     people_log: Vec<String>,
     people_busy: bool,
+    pending_export: Vec<punch_writer::ReadUser>,
 
     // 工作匣／單一視窗
     tray: Option<tray::TrayHandle>,
@@ -286,6 +292,7 @@ impl App {
             access_mode: punch_writer::AccessMode::default(),
             people_log: Vec::new(),
             people_busy: false,
+            pending_export: Vec::new(),
             tray: None,
             window_id: None,
             force_quit: false,
@@ -542,6 +549,80 @@ impl App {
                 self.apply_write_results(res);
                 Task::none()
             }
+            Message::ExportUsers => {
+                let ip = self.edit_punch_clock_ip.trim().to_string();
+                if ip.is_empty() {
+                    self.status_line = "錯誤：請先在「設定」填寫卡鐘 IP".to_string();
+                    self.push_people_log("✗ 匯出失敗：尚未填寫卡鐘 IP".to_string());
+                    return Task::none();
+                }
+                let port = self.edit_port.trim().parse().unwrap_or(1621);
+                self.people_busy = true;
+                self.status_line = format!("正在從卡鐘回讀已註冊人員（{ip}:{port}）…");
+                let sync_tx = self.clock_sync_tx.clone();
+                Task::perform(
+                    async move { Self::read_via_worker(&sync_tx, &ip, port).await },
+                    Message::ExportUsersResult,
+                )
+            }
+            Message::ExportUsersResult(Ok(users)) => {
+                if users.is_empty() {
+                    self.people_busy = false;
+                    self.status_line = "卡鐘中沒有已註冊人員".to_string();
+                    self.push_people_log("✓ 已回讀：卡鐘內沒有已註冊人員".to_string());
+                    return Task::none();
+                }
+                self.pending_export = users;
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("匯出已註冊人員 CSV")
+                            .set_file_name("cardclock_users.csv")
+                            .add_filter("CSV", &["csv"])
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::ExportPathChosen,
+                )
+            }
+            Message::ExportUsersResult(Err(msg)) => {
+                self.people_busy = false;
+                let line = format!("✗ 匯出失敗：{msg}");
+                self.status_line = line.clone();
+                self.push_people_log(line);
+                Task::none()
+            }
+            Message::ExportPathChosen(Some(path)) => {
+                let users = std::mem::take(&mut self.pending_export);
+                let n = users.len();
+                Task::perform(
+                    async move {
+                        std::fs::write(&path, punch_writer::users_csv(&users))
+                            .map(|_| (path.clone(), n))
+                            .map_err(|e| format!("寫入 {path:?} 失敗：{e}"))
+                    },
+                    Message::ExportDone,
+                )
+            }
+            Message::ExportPathChosen(None) => {
+                self.people_busy = false;
+                self.status_line = "已取消匯出".to_string();
+                Task::none()
+            }
+            Message::ExportDone(Ok((path, n))) => {
+                self.people_busy = false;
+                self.status_line = format!("已匯出 {n} 人到 {path:?}");
+                self.push_people_log(format!("✓ 已匯出 {n} 人到 {path:?}"));
+                Task::none()
+            }
+            Message::ExportDone(Err(msg)) => {
+                self.people_busy = false;
+                let line = format!("✗ 匯出失敗：{msg}");
+                self.status_line = line.clone();
+                self.push_people_log(line);
+                Task::none()
+            }
         }
     }
 
@@ -625,6 +706,28 @@ async fn write_via_worker(
         .await
         .map_err(|_| "等待卡鐘寫入回應逾時（300 秒）".to_string())?
         .map_err(|_| "同步 worker 未回應寫入結果".to_string())?
+}
+
+/// 把全範圍回讀委託給 clock-sync worker（同樣先釋放 session，避免撞單一 master 規則）。
+async fn read_via_worker(
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<crate::ua::ClockSyncCmd>,
+    ip: &str,
+    port: u16,
+) -> Result<Vec<punch_writer::ReadUser>, String> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    sync_tx
+        .send(crate::ua::ClockSyncCmd::ReadUsers {
+            ip: ip.to_string(),
+            port,
+            start: 1,
+            end: 0x800,
+            reply,
+        })
+        .map_err(|_| "同步 worker 已結束".to_string())?;
+    tokio::time::timeout(Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| "等待卡鐘回讀逾時（300 秒）".to_string())?
+        .map_err(|_| "同步 worker 未回應回讀結果".to_string())?
 }
 
 /// 位址欄 → `None`(留空=自動) 或合法的 `Some(addr)`
@@ -792,6 +895,7 @@ async fn write_via_worker(
             row![
                 button("新增人員").on_press(Message::AddPerson),
                 button("匯入 CSV（批次新增）").on_press(Message::ImportCsv),
+                button("取得已註冊人員並匯出 CSV").on_press(Message::ExportUsers),
                 if self.people_busy {
                     text("處理中…").size(13)
                 } else {

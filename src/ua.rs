@@ -47,6 +47,15 @@ pub enum ClockSyncCmd {
             Result<Vec<crate::punch_writer::WriteOutcome>, String>,
         >,
     },
+    /// GUI「取得已註冊人員」：worker 先釋放自己的 1621 session，再以一次性連線
+    /// 87H 全範圍回讀已註冊人員；完成後回傳結果給 UI，然後恢復輪詢。
+    ReadUsers {
+        ip: String,
+        port: u16,
+        start: u16,
+        end: u16,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::punch_writer::ReadUser>, String>>,
+    },
 }
 
 /// Parsed RTC reading (`24H` echo / function `0x03`).
@@ -254,6 +263,9 @@ pub async fn run_clock_sync(
             Ok(Some(ClockSyncCmd::WritePeople { ip, port, entries, reply })) => {
                 write_people_oneshot(&ip, port, entries, reply).await;
             }
+            Ok(Some(ClockSyncCmd::ReadUsers { ip, port, start, end, reply })) => {
+                read_users_oneshot(&ip, port, start, end, reply).await;
+            }
             Ok(None) => return Ok(()),
             Err(_) => {}
         }
@@ -299,6 +311,9 @@ pub async fn run_clock_sync(
             }
             Ok(Some(ClockSyncCmd::WritePeople { ip, port, entries, reply })) => {
                 write_people_oneshot(&ip, port, entries, reply).await;
+            }
+            Ok(Some(ClockSyncCmd::ReadUsers { ip, port, start, end, reply })) => {
+                read_users_oneshot(&ip, port, start, end, reply).await;
             }
             Ok(None) => return Ok(()),
             Err(_) => {}
@@ -373,14 +388,23 @@ async fn manage_session(
                     }
                 }
                 Some(ClockSyncCmd::WritePeople { ip, port, entries, reply }) => {
-                    // SOYAL 控制器只接受單一 master 連線：先釋放本session，
-                    // 讓一次性寫入連線不會被拒接/搶奪，寫完再重連恢復輪詢。
                     info!(%ip, port, n = entries.len(), "write: worker 接手寫入，先釋放 session");
                     drop(stream);
                     let res = crate::punch_writer::add_people(&ip, port, 1, entries).await;
                     info!(
                         ok = matches!(res, Ok(_)),
                         "write: worker 寫入結束，回傳結果給 UI",
+                    );
+                    let _ = reply.send(res);
+                    return Ok(());
+                }
+                Some(ClockSyncCmd::ReadUsers { ip, port, start, end, reply }) => {
+                    info!(%ip, port, start, end, "read: worker 接手回讀，先釋放 session");
+                    drop(stream);
+                    let res = crate::punch_writer::read_users(&ip, port, 1, start, end).await;
+                    info!(
+                        ok = matches!(res, Ok(_)),
+                        "read: worker 回讀結束，回傳結果給 UI",
                     );
                     let _ = reply.send(res);
                     return Ok(());
@@ -407,6 +431,19 @@ async fn write_people_oneshot(
 ) {
     info!(%ip, port, n = entries.len(), "write: worker（無 session）直接一次性寫入");
     let res = crate::punch_writer::add_people(ip, port, 1, entries).await;
+    let _ = reply.send(res);
+}
+
+/// 一次性全範圍回讀（worker 沒有活躍 session 時使用）。
+async fn read_users_oneshot(
+    ip: &str,
+    port: u16,
+    start: u16,
+    end: u16,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<crate::punch_writer::ReadUser>, String>>,
+) {
+    info!(%ip, port, start, end, "read: worker（無 session）直接一次性回讀");
+    let res = crate::punch_writer::read_users(ip, port, 1, start, end).await;
     let _ = reply.send(res);
 }
 

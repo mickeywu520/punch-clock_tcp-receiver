@@ -106,6 +106,21 @@ pub struct WriteOutcome {
     pub detail: String,
 }
 
+/// 87H 回讀到的一筆已註冊人員（不含姓名：姓名只能寫入、無法從 87H 回讀）。
+#[derive(Debug, Clone)]
+pub struct ReadUser {
+    pub addr: u16,
+    pub uid_hex: String,
+    pub site: u32,
+    pub card: u32,
+    pub mode: AccessMode,
+    pub zone: u8,
+    pub group1: u8,
+    pub group2: u8,
+    pub expire: Option<String>,
+    pub level: u8,
+}
+
 // ---------------------------------------------------------------------------
 // 封包組裝 / 解析（純函式）
 // ---------------------------------------------------------------------------
@@ -505,6 +520,136 @@ async fn warm_up(conn: &mut Conn, did: u8, timeout: Duration) -> Result<(), Stri
     Ok(())
 }
 
+/// 87H 回讀一筆 24-byte 記錄的「通行模式」（Mode byte bit7~6）。
+fn access_mode_from_byte(mode: u8) -> AccessMode {
+    match mode >> 6 {
+        2 => AccessMode::CardOrPin,
+        3 => AccessMode::CardPlusPin,
+        _ => AccessMode::Card,
+    }
+}
+
+/// 把 87H 回讀的 24-byte record（read24 版面，UID 從 offset 0 開始）解析成 `ReadUser`。
+fn parse_read_user(addr: u16, rec: &[u8]) -> ReadUser {
+    let uid: [u8; 8] = rec[0..8].try_into().unwrap_or([0u8; 8]);
+    let tag32 = &uid[4..8];
+    let site = u32::from(tag32[0]) << 8 | u32::from(tag32[1]);
+    let card = u32::from(tag32[2]) << 8 | u32::from(tag32[3]);
+    let y = rec[16];
+    let m = rec[17];
+    let d = rec[18];
+    let expire = if y | m | d == 0 {
+        None
+    } else {
+        Some(format!("20{y:02}-{m:02}-{d:02}"))
+    };
+    ReadUser {
+        addr,
+        uid_hex: uid.iter().map(|b| format!("{b:02X}")).collect(),
+        site,
+        card,
+        mode: access_mode_from_byte(rec[12]),
+        zone: rec[13],
+        group1: rec[14],
+        group2: rec[15],
+        expire,
+        level: rec[19] >> 6,
+    }
+}
+
+/// 87H 全範圍回讀已註冊人員（唯讀）。每批最多 10 筆；回覆截斷時自動降為逐筆。
+/// 遇到 NACK（0x05）視為表格結束並停止。
+pub async fn read_users(
+    ip: &str,
+    port: u16,
+    did: u8,
+    start: u16,
+    end: u16,
+) -> Result<Vec<ReadUser>, String> {
+    if start == 0 || end < start || end.saturating_sub(start) > 0x0FFF {
+        return Err(format!("無效的掃描範圍 {start}~{end}（需為 1..=2049 且 start<=end）"));
+    }
+    info!(ip, port, start, end, "read: 開始回讀已註冊人員");
+    let mut conn = Conn::open(ip, port).await?;
+    warm_up(&mut conn, did, OP_TIMEOUT).await?;
+    let mut users = Vec::new();
+    let mut addr = start;
+    let mut batch: u16 = READ_BATCH as u16;
+    while addr <= end {
+        batch = batch.min(end - addr + 1);
+        let mut data = Vec::with_capacity(3);
+        data.extend_from_slice(&addr.to_be_bytes());
+        data.push(batch as u8);
+        let pkt = build_short(did, CMD_READ_USER, &data);
+        debug!(addr, batch, "read: 87H 回讀人員");
+        let r = conn.request(&pkt, OP_TIMEOUT).await?;
+        match r.cmd {
+            CMD_DATA => {
+                if r.data.is_empty() {
+                    addr = addr.saturating_add(batch);
+                    continue;
+                }
+                let len = r.data.len().saturating_sub(1);
+                let trailing = len % 24;
+                let body = &r.data[1..];
+                let full = body.len() / 24;
+                if trailing != 0 {
+                    debug!(addr, bytes = r.data.len(), "read: 87H 回覆截斷，降為逐筆");
+                    batch = 1;
+                }
+                for i in 0..full {
+                    let rec = &body[i * 24..i * 24 + 24];
+                    let a = addr.saturating_add(i as u16);
+                    if a > end {
+                        break;
+                    }
+                    if !is_empty_record(rec) {
+                        users.push(parse_read_user(a, rec));
+                        info!(addr = a, uid = %users.last().unwrap().uid_hex, "read: 已註冊人員");
+                    }
+                }
+                addr = addr.saturating_add(full as u16);
+            }
+            ECHO_NACK => {
+                debug!(addr, "read: 87H NACK，視為表格結束");
+                break;
+            }
+            _ => {
+                debug!(addr, cmd = %format!("0x{:02X}", r.cmd), "read: 非預期回覆，跳過此段");
+                addr = addr.saturating_add(batch);
+            }
+        }
+    }
+    info!(ip, port, n = users.len(), "read: 人員回讀完成");
+    Ok(users)
+}
+
+/// 把回讀的人員轉成 CSV（第一行表頭），供 Excel 開啟。欄位：
+/// 位址、姓名（87H 無法回讀，留空供填寫）、卡號（site:card）、卡號(HEX)、
+/// 通行方式、到期日、時區、門組1、門組2、等級。
+pub fn users_csv(users: &[ReadUser]) -> String {
+    fn cell(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+    let mut out = String::from("\u{FEFF}位址,姓名,卡號,卡號(HEX),通行方式,到期日,時區,門組1,門組2,等級\r\n");
+    for u in users {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\r\n",
+            u.addr,
+            cell(""),
+            cell(&format!("{}:{}", u.site, u.card)),
+            cell(&u.uid_hex),
+            cell(u.mode.label()),
+            cell(u.expire.as_deref().unwrap_or("")),
+            u.zone,
+            u.group1,
+            u.group2,
+            u.level
+        ));
+    }
+    out
+}
+
 /// 批次寫入人員。連接一次、逐筆 84H→ACK、選填 2EH→姓名。
 ///
 /// `entries` 中 `addr: None` 者自動掃描空位（依序遞進寫入位址）。
@@ -895,5 +1040,70 @@ mod tests {
     fn csv_invalid_line_reports_row() {
         let s = "not-a-card\n";
         assert!(parse_csv(s.as_bytes()).unwrap_err().contains("第 1 行"));
+    }
+
+    #[test]
+    fn parse_read_user_real_vector() {
+        // 87H 回覆 data（source byte + 24B record）＝ 實機向量（writer 回讀 addr 1000 後）
+        let data = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x8E, 0xA1, 0x4A, // source + UID(8)
+            0xFE, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0xFF, // UID tail + PIN(4)+Mode
+            0xFF, 0x4F, 0x0C, 0x1F, 0x00, 0x00, 0x00, 0x00, // G1+G2+YMD+Level+Option+spare
+            0x00, //
+        ];
+        let rec: Vec<u8> = data[1..].to_vec();
+        assert_eq!(rec.len(), 24);
+        assert!(!is_empty_record(&rec));
+        let u = parse_read_user(1000, &rec);
+        assert_eq!(u.uid_hex, "000000008EA14AFE");
+        assert_eq!(u.site, 0x8EA1);
+        assert_eq!(u.card, 0x4AFE);
+        assert_eq!(u.mode, AccessMode::Card);
+        assert_eq!(u.zone, 0x00);
+        assert_eq!(u.group1, 0xFF);
+        assert_eq!(u.group2, 0xFF);
+        assert_eq!(u.expire.as_deref(), Some("2079-12-31"));
+        assert_eq!(u.level, 0);
+    }
+
+    #[test]
+    fn parse_read_user_no_expiry_when_zeroes() {
+        // 到期日三欄全 0 → None；Level byte 高 2 bits 是等級
+        let rec = [
+            0x00, 0x00, 0x00, 0x00, 0xFD, 0x63, 0x74, 0xF6, //
+            0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0xFF, 0xFF, //
+            0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, //
+        ];
+        let u = parse_read_user(7, &rec);
+        assert_eq!(u.mode, AccessMode::CardOrPin);
+        assert_eq!(u.expire, None);
+        assert_eq!(u.level, 1);
+        assert_eq!(u.uid_hex, "00000000FD6374F6");
+    }
+
+    #[test]
+    fn users_csv_layout() {
+        let u = parse_read_user(2, &[
+            0x00, 0x00, 0x00, 0x00, 0xFD, 0x63, 0x74, 0xF6, //
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0xFF, 0xFF, //
+            0x4F, 0x0C, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        ]);
+        let csv = users_csv(&[u]);
+        assert!(csv.starts_with('\u{FEFF}'));
+        assert!(csv.contains("位址,姓名,卡號"));
+        assert!(csv.contains("2,\"\",\"64867:29942\",\"00000000FD6374F6\",\"卡片驗證\",\"2079-12-31\",0,255,255,0"));
+        assert!(csv.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn read_users_rejects_bad_range() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(read_users("192.0.2.1", 1621, 1, 0, 10))
+            .unwrap_err();
+        assert!(err.contains("無效的掃描範圍"));
     }
 }
