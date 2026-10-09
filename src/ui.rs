@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iced::widget::{button, column, pick_list, row, scrollable, text, text_input};
+use iced::widget::{button, column, pick_list, row, scrollable, text, text_editor, text_input};
 use iced::window;
 use iced::{Alignment, Element, Font, Length, Size, Subscription, Task, Theme};
 
@@ -143,6 +143,8 @@ pub enum Message {
     ClockSyncNow,
     // 工作匣（tray）
     WindowEvent((window::Id, window::Event)),
+    /// 「最近刷卡」文字區的互動（可選取/複製；編輯動作一律忽略＝唯讀）
+    RecentAction(text_editor::Action),
     // 頁籤與人員管理
     TabSelected(Tab),
     EditCard(String),
@@ -191,6 +193,8 @@ struct App {
     status_line: String,
     test_status: Option<String>,
     last_events: Vec<(String, String, String, String)>, // time, uid, event, ip
+    /// 「最近刷卡」的可選取/複製文字區（唯讀）。以 `last_events` 重建。
+    recent_text: text_editor::Content,
     gcp_status: Option<(bool, String)>,
     clock_online: bool,
     clock_rtc: String,
@@ -282,6 +286,7 @@ impl App {
             status_line: flags.initial.status_line,
             test_status: None,
             last_events: Vec::new(),
+            recent_text: text_editor::Content::new(),
             gcp_status: None,
             clock_online: false,
             clock_rtc: "－".to_string(),
@@ -336,6 +341,7 @@ impl App {
                     UiEvent::Punch { time, uid, event, ip } => {
                         self.last_events.insert(0, (time, uid, event, ip));
                         self.last_events.truncate(200);
+                        self.refresh_recent_text();
                     }
                     UiEvent::GcpStatus { ok, count, detail } => {
                         self.gcp_status = Some((ok, format!("{count} 筆 {detail}")));
@@ -355,6 +361,13 @@ impl App {
                     UiEvent::Error(e) => {
                         self.status_line = format!("錯誤：{e}");
                     }
+                }
+                Task::none()
+            }
+            Message::RecentAction(action) => {
+                // 唯讀文字區：允許選取/複製/移動，忽略一切編輯動作。
+                if !action.is_edit() {
+                    self.recent_text.perform(action);
                 }
                 Task::none()
             }
@@ -685,6 +698,17 @@ impl App {
         self.people_log.truncate(300);
     }
 
+    /// 以最新的 `last_events` 重建「最近刷卡」唯讀文字區內容。
+    fn refresh_recent_text(&mut self) {
+        let joined = self
+            .last_events
+            .iter()
+            .map(|(time, uid, event, ip)| format!("{time}  {uid}  {event}  來自 {ip}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.recent_text = text_editor::Content::with_text(&joined);
+    }
+
     /// 把人員寫入委託給 clock-sync worker：worker 先釋放自己的 1621 session 再執行，
 /// 避免撞上 SOYAL 控制器「僅接受單一 master 連線」的規則（否則寫入連線會被即時斷開）。
 async fn write_via_worker(
@@ -834,19 +858,14 @@ async fn read_via_worker(
         ]
         .spacing(4);
 
-        let event_rows = self.last_events.iter().fold(
-            column![],
-            |col, (time, uid, event, ip)| {
-                col.push(text(format!("{time}  {uid}  {event}  來自 {ip}")).size(13))
-            },
-        );
         let events = column![
             text("最近刷卡").size(18),
-            if self.last_events.is_empty() {
-                column![text("（尚無）")].push(text(""))
-            } else {
-                event_rows
-            },
+            text("（可用滑鼠選取後 Ctrl+C 複製卡號，再到「人員管理」貼上新增）").size(12),
+            text_editor(&self.recent_text)
+                .on_action(Message::RecentAction)
+                .size(13)
+                .padding(6)
+                .height(Length::Fill),
         ]
         .spacing(4);
 
