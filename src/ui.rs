@@ -756,6 +756,8 @@ async fn read_via_worker(
             ]
             .spacing(4),
             text("關閉視窗＝收進工作匣").size(12),
+            text("").width(Length::Fill),
+            text(current_version()).size(13),
         ]
         .align_y(Alignment::Center)
         .spacing(16);
@@ -773,13 +775,7 @@ async fn read_via_worker(
             Tab::Settings => self.settings_view(),
         };
 
-        let footer = row![
-            text("").width(Length::Fill),
-            text(current_version()).size(12),
-        ]
-        .align_y(Alignment::Center);
-
-        column![header, tab_bar, content, footer]
+        column![header, tab_bar, content]
             .spacing(12)
             .padding(16)
             .into()
@@ -798,7 +794,7 @@ async fn read_via_worker(
     /// 監控頁：本機 IP／卡鐘狀態／最近刷卡
     fn monitor_view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
         let local_ips = self.local_ips.iter().fold(
-            column![].push(text("本機 IPv4（填入卡鐘後台 Message Server IP 1st）：").size(16)),
+            column![].push(text("本機 IPv4：").size(16)),
             |col, ip| col.push(text(ip.clone()).size(28)),
         );
 
