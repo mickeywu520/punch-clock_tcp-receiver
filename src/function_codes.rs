@@ -49,6 +49,9 @@ pub fn lookup(code: u32) -> Option<EventInfo> {
         100 => ("Access ok : access via vein", "靜脈進出成功"),
         101 => ("Access reject : access via vein", "靜脈進出失敗"),
         104 => ("Fire alarm input trigged", "火警輸入觸發"),
+        108 => ("Face ID Passed", "人臉辨識通行成功"),
+        109 => ("Face ID Rejected", "人臉辨識通行失敗"),
+        112 => ("Black list of Face ID", "人臉識別黑名單"),
         114 => ("Remote Time Attendance", "遠端考勤"),
         _ => return None,
     };

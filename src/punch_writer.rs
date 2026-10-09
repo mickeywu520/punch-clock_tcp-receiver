@@ -32,6 +32,7 @@ pub const CMD_SET_USER: u8 = 0x84; // 新增/覆寫人員（無 APB）
 #[allow(dead_code)]
 pub const CMD_SET_USER_APB: u8 = 0x83; // 同上（含 anti-pass-back）
 pub const CMD_WRITE_ALIAS: u8 = 0x2E; // 寫入姓名
+pub const CMD_READ_ALIAS: u8 = 0x2E; // 回讀姓名（同一指令，靠封包長度區分讀/寫）
 pub const CMD_READ_USER: u8 = 0x87; // 回讀人員
 pub const CMD_READ_RTC: u8 = 0x24; // 讀取時間＋韌體版本（連線暖身用）
 
@@ -119,6 +120,8 @@ pub struct ReadUser {
     pub group2: u8,
     pub expire: Option<String>,
     pub level: u8,
+    /// 姓名（2EH 回讀；87H 不含姓名）。無姓名或讀取失敗為 `None`。
+    pub name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +557,62 @@ fn parse_read_user(addr: u16, rec: &[u8]) -> ReadUser {
         group2: rec[15],
         expire,
         level: rec[19] >> 6,
+        name: None,
     }
+}
+
+/// 組出 2EH 讀取姓名的資料欄：`Index(3, big-endian) + Records(1)`。
+pub fn build_read_alias_data(addr: u16, count: u8) -> Vec<u8> {
+    vec![0x00, (addr >> 8) as u8, addr as u8, count]
+}
+
+/// 解析單筆 2EH 姓名（16 bytes，Big5；首個 0x00 為結束）。
+/// 全空或解碼後為空字串回 `None`。
+fn decode_alias(rec: &[u8]) -> Option<String> {
+    let end = rec.iter().position(|&b| b == 0).unwrap_or(rec.len());
+    let slice = &rec[..end];
+    if slice.is_empty() || slice.iter().all(|&b| b == 0xFF) {
+        return None;
+    }
+    let (text, _, _) = encoding_rs::BIG5.decode(slice);
+    let t = text.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// 2EH 回讀姓名：`addr` 起連續 `count` 筆，每筆 16 bytes Big5。
+///
+/// 實機（AR-821EF v5 / 4V6）驗證：回覆 Command `0x03`、**無 Source ID**、
+/// 每筆固定 16 bytes（與 87H 不同）；空位址回 16×`FF`。寫入/回讀成對驗證通過。
+async fn read_aliases(
+    conn: &mut Conn,
+    did: u8,
+    addr: u16,
+    count: u16,
+) -> Result<Vec<Option<String>>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let data = build_read_alias_data(addr, count.min(255) as u8);
+    let pkt = build_short(did, CMD_READ_ALIAS, &data);
+    let r = conn.request(&pkt, OP_TIMEOUT).await?;
+    if r.cmd != CMD_DATA {
+        return Err(format!("姓名回讀未取得資料（echo 0x{:02X}）", r.cmd));
+    }
+    let body = &r.data; // 2EH 回覆不含 Source ID
+    let full = body.len() / 16;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        if i < full {
+            out.push(decode_alias(&body[i * 16..i * 16 + 16]));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
 }
 
 /// 87H 全範圍回讀已註冊人員（唯讀）。每批最多 10 筆；回覆截斷時自動降為逐筆。
@@ -597,6 +655,18 @@ pub async fn read_users(
                     debug!(addr, bytes = r.data.len(), "read: 87H 回覆截斷，降為逐筆");
                     batch = 1;
                 }
+                // 2EH 回讀同段姓名（best-effort：失敗僅省略姓名，不影響人員匯出）
+                let aliases = if full > 0 {
+                    match read_aliases(&mut conn, did, addr, full as u16).await {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            debug!(addr, %e, "read: 姓名回讀失敗，省略姓名");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 for i in 0..full {
                     let rec = &body[i * 24..i * 24 + 24];
                     let a = addr.saturating_add(i as u16);
@@ -604,8 +674,13 @@ pub async fn read_users(
                         break;
                     }
                     if !is_empty_record(rec) {
-                        users.push(parse_read_user(a, rec));
-                        info!(addr = a, uid = %users.last().unwrap().uid_hex, "read: 已註冊人員");
+                        let mut u = parse_read_user(a, rec);
+                        u.name = aliases
+                            .as_ref()
+                            .and_then(|v| v.get(i))
+                            .and_then(|n| n.clone());
+                        info!(addr = a, uid = %u.uid_hex, name = u.name.as_deref().unwrap_or(""), "read: 已註冊人員");
+                        users.push(u);
                     }
                 }
                 addr = addr.saturating_add(full as u16);
@@ -625,7 +700,7 @@ pub async fn read_users(
 }
 
 /// 把回讀的人員轉成 CSV（第一行表頭），供 Excel 開啟。欄位：
-/// 位址、姓名（87H 無法回讀，留空供填寫）、卡號（site:card）、卡號(HEX)、
+/// 位址、姓名（由 2EH 回讀，無則留空）、卡號（site:card）、卡號(HEX)、
 /// 通行方式、到期日、時區、門組1、門組2、等級。
 pub fn users_csv(users: &[ReadUser]) -> String {
     fn cell(s: &str) -> String {
@@ -636,7 +711,7 @@ pub fn users_csv(users: &[ReadUser]) -> String {
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{}\r\n",
             u.addr,
-            cell(""),
+            cell(u.name.as_deref().unwrap_or("")),
             cell(&format!("{}:{}", u.site, u.card)),
             cell(&u.uid_hex),
             cell(u.mode.label()),
@@ -1105,5 +1180,45 @@ mod tests {
             .block_on(read_users("192.0.2.1", 1621, 1, 0, 10))
             .unwrap_err();
         assert!(err.contains("無效的掃描範圍"));
+    }
+
+    #[test]
+    fn read_alias_data_layout() {
+        // 2EH 讀取：Index(3, BE) + Records(1)
+        assert_eq!(build_read_alias_data(1, 1), vec![0x00, 0x00, 0x01, 0x01]);
+        assert_eq!(build_read_alias_data(256, 3), vec![0x00, 0x01, 0x00, 0x03]);
+    }
+
+    #[test]
+    fn decode_alias_terminates_at_nul() {
+        // 實機 addr1 回讀：'Lee\0' + 殘留 → 應只取 "Lee"
+        let mut rec = [0u8; 16];
+        rec[..4].copy_from_slice(b"Lee\0");
+        rec[4..8].copy_from_slice(b"uMod");
+        assert_eq!(decode_alias(&rec).as_deref(), Some("Lee"));
+    }
+
+    #[test]
+    fn decode_alias_big5_and_empty() {
+        // Big5「王小明」= A4 FD A4 70 A9 FA（實機寫入/回讀驗證向量）
+        let mut rec = [0x00u8; 16];
+        rec[..6].copy_from_slice(&[0xA4, 0xFD, 0xA4, 0x70, 0xA9, 0xFA]);
+        assert_eq!(decode_alias(&rec).as_deref(), Some("王小明"));
+        // 空槽 16 bytes 全 0xFF → None
+        assert_eq!(decode_alias(&[0xFF; 16]), None);
+        // 全 0x00 → None
+        assert_eq!(decode_alias(&[0x00; 16]), None);
+    }
+
+    #[test]
+    fn users_csv_includes_name() {
+        let mut u = parse_read_user(2, &[
+            0x00, 0x00, 0x00, 0x00, 0xFD, 0x63, 0x74, 0xF6, //
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0xFF, 0xFF, //
+            0x4F, 0x0C, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        ]);
+        u.name = Some("李雅英".to_string());
+        let csv = users_csv(&[u]);
+        assert!(csv.contains("2,\"李雅英\",\"64867:29942\",\"00000000FD6374F6\",\"卡片驗證\",\"2079-12-31\",0,255,255,0"));
     }
 }
