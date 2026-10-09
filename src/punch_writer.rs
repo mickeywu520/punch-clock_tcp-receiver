@@ -78,10 +78,17 @@ impl AccessMode {
     }
 
     fn mode_byte(self) -> u8 {
+        // Bit4「Card omitted after fingerprint」＋ Bit3「Fingerprint omitted after card」。
+        // 實機（AR-821EFv5，含人臉模組）實測：若這兩個位元為 0，控制器會把每次刷卡
+        // 視為「卡＋生物特徵」多因子，卡單獨刷無法完成（面板停在「影像 + 讀卡/密碼」，
+        // 且不產生 M11 事件）；設為 1 後卡單獨刷即可完成並產生 M11。
+        // 本機自行登錄的人員 Mode = 0x58（＝此二位元已設），故比照設定。
+        //   0x40 → 0x58（卡片驗證）、0x80 → 0x98（卡片或密碼）、0xC0 → 0xD8（卡片+密碼）
+        const SKIP_BIOMETRIC: u8 = 0x18;
         match self {
-            AccessMode::Card => 0x40,
-            AccessMode::CardOrPin => 0x80,
-            AccessMode::CardPlusPin => 0xC0,
+            AccessMode::Card => 0x40 | SKIP_BIOMETRIC,
+            AccessMode::CardOrPin => 0x80 | SKIP_BIOMETRIC,
+            AccessMode::CardPlusPin => 0xC0 | SKIP_BIOMETRIC,
         }
     }
 }
@@ -1085,9 +1092,14 @@ mod tests {
     #[test]
     fn access_mode_map() {
         assert_eq!(AccessMode::from_label("卡片或密碼"), AccessMode::CardOrPin);
-        assert_eq!(AccessMode::Card.mode_byte(), 0x40);
-        assert_eq!(AccessMode::CardOrPin.mode_byte(), 0x80);
-        assert_eq!(AccessMode::CardPlusPin.mode_byte(), 0xC0);
+        // 實機（AR-821EFv5，含人臉模組）驗證：card 模式須帶 bit4/bit3（0x18）才會產生 M11。
+        assert_eq!(AccessMode::Card.mode_byte(), 0x58);
+        assert_eq!(AccessMode::CardOrPin.mode_byte(), 0x98);
+        assert_eq!(AccessMode::CardPlusPin.mode_byte(), 0xD8);
+        // bit7~6 仍為存取模式（01/10/11）
+        assert_eq!(AccessMode::Card.mode_byte() >> 6, 0x01);
+        assert_eq!(AccessMode::CardOrPin.mode_byte() >> 6, 0x02);
+        assert_eq!(AccessMode::CardPlusPin.mode_byte() >> 6, 0x03);
     }
 
     #[test]
