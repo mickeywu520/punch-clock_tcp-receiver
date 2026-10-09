@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, ListenMode, PunchWindow};
 use crate::dedup::PunchDedup;
@@ -129,25 +129,34 @@ async fn handle_conn(
                 if classify_enabled && !windows.is_empty() {
                     punch = classify_windows(punch, &windows);
                 }
-                let received_at = Utc::now().fixed_offset();
-                let gcp = GcpPunchEvent::from_punch(
-                    &punch,
-                    &device,
-                    &peer.ip().to_string(),
-                    &receiver_id,
-                    received_at,
-                );
-                count += 1;
-                tx.send(gcp)
-                    .map_err(|_| anyhow::anyhow!("delivery worker is gone"))?;
-                info!(
-                    peer = %peer,
-                    node = punch.node_id,
-                    event = %punch.event_code,
-                    uid = %punch.uid_hex,
-                    occurred_at = %punch.occurred_at.to_rfc3339(),
-                    "punch event parsed"
-                );
+                if crate::function_codes::is_gcp_forwardable(&punch.event_code) {
+                    let received_at = Utc::now().fixed_offset();
+                    let gcp = GcpPunchEvent::from_punch(
+                        &punch,
+                        &device,
+                        &peer.ip().to_string(),
+                        &receiver_id,
+                        received_at,
+                    );
+                    count += 1;
+                    tx.send(gcp)
+                        .map_err(|_| anyhow::anyhow!("delivery worker is gone"))?;
+                    info!(
+                        peer = %peer,
+                        node = punch.node_id,
+                        event = %punch.event_code,
+                        uid = %punch.uid_hex,
+                        occurred_at = %punch.occurred_at.to_rfc3339(),
+                        "punch event parsed"
+                    );
+                } else {
+                    debug!(
+                        peer = %peer,
+                        event = %punch.event_code,
+                        uid = %punch.uid_hex,
+                        "event not in GCP allowlist (M11/M108), not forwarded"
+                    );
+                }
                 if let Some(ui) = &ui {
                     ui.send(UiEvent::Punch {
                         time: punch.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string(),

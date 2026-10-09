@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::dedup::PunchDedup;
@@ -706,15 +706,24 @@ async fn forward_event(
         ev = classify_windows(ev, &windows);
     }
     let received_at = Utc::now().fixed_offset();
-    let gcp = GcpPunchEvent::from_punch(&ev, &device, ip, &receiver_id, received_at);
-    tx.send(gcp).map_err(|_| "delivery worker is gone".to_string())?;
-    info!(
-        node = ev.node_id,
-        event = %ev.event_code,
-        uid = %ev.uid_hex,
-        occurred_at = %ev.occurred_at.to_rfc3339(),
-        "punch event pulled via 25H"
-    );
+    if function_codes::is_gcp_forwardable(&ev.event_code) {
+        let gcp = GcpPunchEvent::from_punch(&ev, &device, ip, &receiver_id, received_at);
+        tx.send(gcp).map_err(|_| "delivery worker is gone".to_string())?;
+        info!(
+            node = ev.node_id,
+            event = %ev.event_code,
+            uid = %ev.uid_hex,
+            occurred_at = %ev.occurred_at.to_rfc3339(),
+            "punch event pulled via 25H"
+        );
+    } else {
+        debug!(
+            node = ev.node_id,
+            event = %ev.event_code,
+            uid = %ev.uid_hex,
+            "event not in GCP allowlist (M11/M108), not forwarded"
+        );
+    }
     if let Some(ui) = ui {
         ui.send(UiEvent::Punch {
             time: ev.occurred_at.format("%Y-%m-%d %H:%M:%S").to_string(),

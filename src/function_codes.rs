@@ -66,3 +66,32 @@ pub fn lookup(code: u32) -> Option<EventInfo> {
 pub fn event_code(code: u32) -> String {
     format!("M{code}")
 }
+
+/// 轉拋到 GCP 的允許清單：目前只轉送
+/// **M11（正常進出／刷卡）** 與 **M108（人臉辨識通行成功）**，
+/// 其餘事件仍會在 UI 顯示與記錄，但不送往後台。
+pub fn is_gcp_forwardable(event_code: &str) -> bool {
+    matches!(event_code, "M11" | "M108")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcp_allowlist_only_m11_m108() {
+        assert!(is_gcp_forwardable("M11"));
+        assert!(is_gcp_forwardable("M108"));
+        assert!(!is_gcp_forwardable("M24"));
+        assert!(!is_gcp_forwardable("M3"));
+        assert!(!is_gcp_forwardable("M109"));
+        assert!(!is_gcp_forwardable(""));
+    }
+
+    #[test]
+    fn face_codes_present() {
+        assert_eq!(lookup(108).unwrap().zh, "人臉辨識通行成功");
+        assert_eq!(lookup(109).unwrap().zh, "人臉辨識通行失敗");
+        assert_eq!(lookup(112).unwrap().zh, "人臉識別黑名單");
+    }
+}
