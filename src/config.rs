@@ -200,6 +200,8 @@ pub struct Config {
     pub log_level: String,
     pub classify: ClassifyConfig,
     pub gcp: GcpConfig,
+    /// 第二套系統（人資後台）；欄位與 `gcp` 相同，事件會同時送到兩邊。
+    pub hr: GcpConfig,
     pub clock_sync: ClockSyncConfig,
     pub event_pull: EventPullConfig,
 }
@@ -217,6 +219,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             classify: ClassifyConfig::default(),
             gcp: GcpConfig::default(),
+            hr: GcpConfig::default(),
             clock_sync: ClockSyncConfig::default(),
             event_pull: EventPullConfig::default(),
         }
@@ -269,6 +272,18 @@ fn apply_env_overrides(cfg: &mut Config) {
     if let Some(h) = env_string("PUNCH_GCP_API_KEY_HEADER") {
         cfg.gcp.api_key_header = Some(h);
     }
+    if let Some(url) = env_string("PUNCH_HR_URL") {
+        cfg.hr.endpoint_url = Some(url);
+    }
+    if let Some(tok) = env_string("PUNCH_HR_TOKEN") {
+        cfg.hr.bearer_token = Some(tok);
+    }
+    if let Some(k) = env_string("PUNCH_HR_API_KEY") {
+        cfg.hr.api_key_value = Some(k);
+    }
+    if let Some(h) = env_string("PUNCH_HR_API_KEY_HEADER") {
+        cfg.hr.api_key_header = Some(h);
+    }
     if let Some(id) = env_string("PUNCH_RECEIVER_ID") {
         cfg.receiver_id = id;
     }
@@ -294,5 +309,6 @@ mod tests {
         assert_eq!(cfg.listen.port, 8031);
         assert_eq!(cfg.receiver_id, "punch-clock-01");
         assert_eq!(cfg.timezone_offset_seconds, 28800);
+        assert_eq!(cfg.hr.api_key_header.as_deref(), Some("X-Api-Key"));
     }
 }

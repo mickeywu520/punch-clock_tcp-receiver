@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
-use forwarder::Delivery;
+use forwarder::{Delivery, Target};
 use model::GcpPunchEvent;
 use ui::{UiBus, UiEvent};
 
@@ -82,15 +82,30 @@ fn main() -> anyhow::Result<()> {
         rt.spawn(async move { server::run(shared, tx, Some(ui), devices, dedup).await })
     };
 
-    let delivery = Arc::new(
-        rt.block_on(async {
-            Delivery::new(shared.clone(), spool_dir_from(&shared).await).await
-        })?,
-    );
+    let (spool_dir, hr_spool_dir) = rt.block_on(async {
+        let d = spool_dir_from(&shared).await;
+        (d.clone(), d.join("hr"))
+    });
+    let delivery = Arc::new(rt.block_on(Delivery::new(
+        shared.clone(),
+        spool_dir,
+        Target::Gcp,
+    ))?);
+    // 人資後台獨立 spool，一邊送失敗不會影響另一邊。
+    let hr_delivery = Arc::new(rt.block_on(Delivery::new(
+        shared.clone(),
+        hr_spool_dir,
+        Target::Hr,
+    ))?);
     let delivery_task = {
         let shared = shared.clone();
         let ui = ui.clone();
-        rt.spawn(run_delivery(delivery, shared, Some(ui), rx))
+        rt.spawn(run_delivery(
+            vec![delivery, hr_delivery],
+            shared,
+            Some(ui),
+            rx,
+        ))
     };
 
     // Poll the card clock RTC periodically and auto-correct drift; also handles
@@ -126,11 +141,18 @@ fn main() -> anyhow::Result<()> {
                         command_port: g.punch_clock.command_port.to_string(),
                         endpoint: g.gcp.endpoint_url.clone().unwrap_or_default(),
                         api_key: g.gcp.api_key_value.clone().unwrap_or_default(),
+                        hr_endpoint: g.hr.endpoint_url.clone().unwrap_or_default(),
+                        hr_api_key: g.hr.api_key_value.clone().unwrap_or_default(),
                         status_line: format!(
-                            "就緒。本機監聽 {}:{}，GCP {}。",
+                            "就緒。本機監聽 {}:{}，GCP {}、人資 {}。",
                             g.listen.bind,
                             g.listen.port,
                             if g.gcp.endpoint_url.is_some() {
+                                "已設定"
+                            } else {
+                                "未設定"
+                            },
+                            if g.hr.endpoint_url.is_some() {
                                 "已設定"
                             } else {
                                 "未設定"
@@ -266,51 +288,48 @@ async fn shutdown_signal() {
 }
 
 async fn run_delivery(
-    delivery: Arc<Delivery>,
+    deliveries: Vec<Arc<Delivery>>,
     shared: Arc<RwLock<Config>>,
     ui: Option<UiBus>,
     rx: UnboundedReceiver<GcpPunchEvent>,
 ) -> anyhow::Result<()> {
-    let (batch_enabled, spool_dir) = {
-        let g = shared.read().await;
-        (g.gcp.batch_enabled, g.spool_dir.clone())
-    };
+    let batch_enabled = shared.read().await.gcp.batch_enabled;
 
-    if delivery.configured().await {
-        let (sent, kept) = delivery.replay_spool().await?;
-        info!(sent, kept, "spool replay finished");
-    } else {
-        warn!(
-            "gcp.endpoint_url is not configured; events will only be spooled to {}",
-            spool_dir.display()
-        );
-        if let Some(ui) = &ui {
-            ui.send(UiEvent::Error(
-                "尚未設定 GCP Endpoint，刷卡事件僅會暫存到 spool".to_string(),
-            ));
+    for d in &deliveries {
+        let label = d.target().label();
+        if d.configured().await {
+            let (sent, kept) = d.replay_spool().await?;
+            info!(target = label, sent, kept, "spool replay finished");
+        } else {
+            warn!(target = label, "endpoint_url is not configured; events will not be sent");
+            if let Some(ui) = &ui {
+                ui.send(UiEvent::Error(format!(
+                    "尚未設定 {label} Endpoint，該系統不會收到刷卡事件"
+                )));
+            }
         }
     }
 
     if batch_enabled {
-        run_batched(delivery, shared, ui, rx).await
+        run_batched(deliveries, shared, ui, rx).await
     } else {
-        run_immediate(delivery, ui, rx).await
+        run_immediate(deliveries, ui, rx).await
     }
 }
 
 async fn run_immediate(
-    delivery: Arc<Delivery>,
+    deliveries: Vec<Arc<Delivery>>,
     ui: Option<UiBus>,
     mut rx: UnboundedReceiver<GcpPunchEvent>,
 ) -> anyhow::Result<()> {
     while let Some(ev) = rx.recv().await {
-        deliver_batch(&delivery, &ui, &[ev]).await;
+        deliver_batch(&deliveries, &ui, &[ev]).await;
     }
     Ok(())
 }
 
 async fn run_batched(
-    delivery: Arc<Delivery>,
+    deliveries: Vec<Arc<Delivery>>,
     shared: Arc<RwLock<Config>>,
     ui: Option<UiBus>,
     mut rx: UnboundedReceiver<GcpPunchEvent>,
@@ -332,20 +351,20 @@ async fn run_batched(
                 Some(ev) => {
                     buffer.push(ev);
                     if buffer.len() >= max_items {
-                        deliver_batch(&delivery, &ui, &buffer).await;
+                        deliver_batch(&deliveries, &ui, &buffer).await;
                         buffer.clear();
                     }
                 }
                 None => {
                     if !buffer.is_empty() {
-                        deliver_batch(&delivery, &ui, &buffer).await;
+                        deliver_batch(&deliveries, &ui, &buffer).await;
                     }
                     return Ok(());
                 }
             },
             _ = tick.tick() => {
                 if !buffer.is_empty() {
-                    deliver_batch(&delivery, &ui, &buffer).await;
+                    deliver_batch(&deliveries, &ui, &buffer).await;
                     buffer.clear();
                 }
             }
@@ -353,32 +372,55 @@ async fn run_batched(
     }
 }
 
-async fn deliver_batch(delivery: &Delivery, ui: &Option<UiBus>, events: &[GcpPunchEvent]) {
+async fn deliver_batch(
+    deliveries: &[Arc<Delivery>],
+    ui: &Option<UiBus>,
+    events: &[GcpPunchEvent],
+) {
     if events.is_empty() {
         return;
     }
     let n = events.len();
-    match delivery.deliver(events).await {
-        Ok(sent) => {
-            info!(n, "events delivered to gcp");
-            if let Some(ui) = ui {
-                ui.send(UiEvent::GcpStatus {
-                    ok: true,
-                    count: sent as usize,
-                    detail: "success".to_string(),
-                });
+    let mut any_configured = false;
+    // shortcut: 目的地依序送出，GCP 失敗重試會延後人資送達；需獨立節奏時改併發。
+    for d in deliveries {
+        if !d.configured().await {
+            continue;
+        }
+        any_configured = true;
+        let target = d.target().label();
+        match d.deliver(events).await {
+            Ok(sent) => {
+                info!(n, target, "events delivered");
+                if let Some(ui) = ui {
+                    ui.send(UiEvent::DeliveryStatus {
+                        target,
+                        ok: true,
+                        count: sent as usize,
+                        detail: "success".to_string(),
+                    });
+                }
+            }
+            Err(msg) => {
+                warn!(n, target, %msg, "delivery failed, spooling events");
+                if let Some(ui) = ui {
+                    ui.send(UiEvent::DeliveryStatus {
+                        target,
+                        ok: false,
+                        count: 0,
+                        detail: msg.clone(),
+                    });
+                }
+                if let Err(e) = d.spool(events) {
+                    error!(err = %e, n, target, "cannot spool events");
+                }
             }
         }
-        Err(msg) => {
-            warn!(n, %msg, "delivery failed, spooling events");
-            if let Some(ui) = ui {
-                ui.send(UiEvent::GcpStatus {
-                    ok: false,
-                    count: 0,
-                    detail: msg.clone(),
-                });
-            }
-            if let Err(e) = delivery.spool(events) {
+    }
+    if !any_configured {
+        // 兩邊都沒設定時沿用舊行為：暫存一份，避免事件遺失。
+        if let Some(d) = deliveries.first() {
+            if let Err(e) = d.spool(events) {
                 error!(err = %e, n, "cannot spool events");
             }
         }

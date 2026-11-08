@@ -17,6 +17,6 @@
 
 - `X-Api-Key` 錯或後台未設 `PUNCH_API_KEY` → 回 401；正式機 `.env` 必須設置（readme §7.3）。
 - 後台端點一律回 **HTTP 200 + per-item `status`**（`ok` / `duplicate` / `unknown_card` / `inactive` / `error`），**永不回 4xx（除 429）**（readme §7.4）。
-- 必填僅 `event_id`、`occurred_at`、`card`；`card` 至少一種：`card_number_hi+lo`（優先）、或 `uid_hex`、或 `uid_decimal`（readme §7.2、§8.1）。
+- 必填僅 `event_id`、`occurred_at`、`card`;**本系統後端只認 `card.uid_hex`**(缺時以 `uid_decimal` 換算),`card_number_hi+lo` / `site_code` / `card_code` 會被忽略(禾笙 HR v1.9)。
 - `occurred_at` 一定要帶時區（`+08:00`），receiver 預設即有，沿用即可。
 - 冪等：以 `event_id` 去重，重送回 `duplicate`，`punch_count` 不重複計（readme §7.5）。

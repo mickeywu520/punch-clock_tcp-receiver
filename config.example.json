@@ -49,5 +49,16 @@
     "batch_enabled": false,
     "batch_max_items": 100,
     "batch_flush_interval_secs": 5
+  },
+  "hr": {
+    "endpoint_url": "http://127.0.0.1:3000/api/v1/punch-events",
+    "bearer_token": "",
+    "api_key_header": "X-Api-Key",
+    "api_key_value": "",
+    "timeout_secs": 10,
+    "retry_attempts": 5,
+    "batch_enabled": false,
+    "batch_max_items": 100,
+    "batch_flush_interval_secs": 5
   }
 }

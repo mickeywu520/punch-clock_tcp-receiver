@@ -38,7 +38,8 @@ pub enum UiEvent {
         event: String,
         ip: String,
     },
-    GcpStatus {
+    DeliveryStatus {
+        target: &'static str,
         ok: bool,
         count: usize,
         detail: String,
@@ -98,6 +99,8 @@ pub struct InitialSettings {
     pub command_port: String,
     pub endpoint: String,
     pub api_key: String,
+    pub hr_endpoint: String,
+    pub hr_api_key: String,
     pub status_line: String,
 }
 
@@ -136,6 +139,8 @@ pub enum Message {
     EditPort(String),
     EditEndpoint(String),
     EditApiKey(String),
+    EditHrEndpoint(String),
+    EditHrApiKey(String),
     Save,
     SaveResult(Result<(), String>),
     TestConnect,
@@ -161,6 +166,9 @@ pub enum Message {
     ExportUsersResult(Result<Vec<punch_writer::ReadUser>, String>),
     ExportPathChosen(Option<PathBuf>),
     ExportDone(Result<(PathBuf, usize), String>),
+    // 從卡鐘回讀姓名（uid_hex → 姓名），供監控頁顯示
+    RefreshNames,
+    NamesLoaded(Result<Vec<punch_writer::ReadUser>, String>),
 }
 
 /// 頂部頁籤
@@ -189,13 +197,19 @@ struct App {
     edit_port: String,
     edit_endpoint: String,
     edit_api_key: String,
+    edit_hr_endpoint: String,
+    edit_hr_api_key: String,
 
     status_line: String,
     test_status: Option<String>,
     last_events: Vec<(String, String, String, String)>, // time, uid, event, ip
     /// 「最近刷卡」的可選取/複製文字區（唯讀）。以 `last_events` 重建。
     recent_text: text_editor::Content,
-    gcp_status: Option<(bool, String)>,
+    /// uid_hex → 姓名（由卡鐘 2EH 回讀，best-effort）
+    names: HashMap<String, String>,
+    names_requested: bool,
+    /// 各目的地的送達狀態（key = Target::label()）
+    delivery_status: HashMap<&'static str, (bool, String)>,
     clock_online: bool,
     clock_rtc: String,
 
@@ -283,11 +297,15 @@ impl App {
             },
             edit_endpoint: flags.initial.endpoint,
             edit_api_key: flags.initial.api_key,
+            edit_hr_endpoint: flags.initial.hr_endpoint,
+            edit_hr_api_key: flags.initial.hr_api_key,
             status_line: flags.initial.status_line,
             test_status: None,
             last_events: Vec::new(),
             recent_text: text_editor::Content::new(),
-            gcp_status: None,
+            names: HashMap::new(),
+            names_requested: false,
+            delivery_status: HashMap::new(),
             clock_online: false,
             clock_rtc: "－".to_string(),
             tab: Tab::default(),
@@ -328,6 +346,11 @@ impl App {
                 if let Some(cmd) = tray::poll_tray() {
                     task = task.chain(self.handle_tray(cmd));
                 }
+                // 啟動後自動回讀一次姓名；卡鐘未設定 IP 時略過（之後可手動按鈕）。
+                if !self.names_requested && !self.clock_ip.is_empty() {
+                    self.names_requested = true;
+                    task = task.chain(self.refresh_names_task());
+                }
                 task
             }
             Message::Ui(ev) => {
@@ -343,8 +366,9 @@ impl App {
                         self.last_events.truncate(200);
                         self.refresh_recent_text();
                     }
-                    UiEvent::GcpStatus { ok, count, detail } => {
-                        self.gcp_status = Some((ok, format!("{count} 筆 {detail}")));
+                    UiEvent::DeliveryStatus { target, ok, count, detail } => {
+                        self.delivery_status
+                            .insert(target, (ok, format!("{count} 筆 {detail}")));
                     }
                     UiEvent::ClockStatus { online, rtc, note } => {
                         self.clock_online = online;
@@ -401,6 +425,14 @@ impl App {
                 self.edit_api_key = s;
                 Task::none()
             }
+            Message::EditHrEndpoint(s) => {
+                self.edit_hr_endpoint = s;
+                Task::none()
+            }
+            Message::EditHrApiKey(s) => {
+                self.edit_hr_api_key = s;
+                Task::none()
+            }
             Message::Save => {
                 let cfg_path = self.cfg_path.clone();
                 let external = self.external.clone();
@@ -408,9 +440,15 @@ impl App {
                 let port = self.edit_port.trim().to_string();
                 let endpoint = self.edit_endpoint.trim().to_string();
                 let api_key = self.edit_api_key.trim().to_string();
+                let hr_endpoint = self.edit_hr_endpoint.trim().to_string();
+                let hr_api_key = self.edit_hr_api_key.trim().to_string();
                 Task::perform(
                     async move {
-                        save_config(external, cfg_path, punch_ip, port, endpoint, api_key).await
+                        save_config(
+                            external, cfg_path, punch_ip, port, endpoint, api_key, hr_endpoint,
+                            hr_api_key,
+                        )
+                        .await
                     },
                     Message::SaveResult,
                 )
@@ -636,6 +674,28 @@ impl App {
                 self.push_people_log(line);
                 Task::none()
             }
+            Message::RefreshNames => {
+                self.names_requested = true;
+                if self.edit_punch_clock_ip.trim().is_empty() {
+                    self.status_line = "錯誤：請先在「設定」填寫卡鐘 IP".to_string();
+                    return Task::none();
+                }
+                self.status_line = "正在從卡鐘回讀姓名…".to_string();
+                self.refresh_names_task()
+            }
+            Message::NamesLoaded(Ok(users)) => {
+                self.names = users
+                    .into_iter()
+                    .filter_map(|u| u.name.map(|n| (u.uid_hex, n)))
+                    .collect();
+                self.refresh_recent_text();
+                self.status_line = format!("已載入 {} 個姓名", self.names.len());
+                Task::none()
+            }
+            Message::NamesLoaded(Err(msg)) => {
+                self.status_line = format!("姓名回讀失敗（不影響打卡）：{msg}");
+                Task::none()
+            }
         }
     }
 
@@ -703,10 +763,26 @@ impl App {
         let joined = self
             .last_events
             .iter()
-            .map(|(time, uid, event, ip)| format!("{time}  {uid}  {event}  來自 {ip}"))
+            .map(|(time, uid, event, ip)| {
+                format_event(self.names.get(uid).map(String::as_str), time, uid, event, ip)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         self.recent_text = text_editor::Content::with_text(&joined);
+    }
+
+    /// 從卡鐘回讀姓名（透過 clock-sync worker 先釋放 session）。
+    fn refresh_names_task(&self) -> Task<Message> {
+        let ip = self.edit_punch_clock_ip.trim().to_string();
+        if ip.is_empty() {
+            return Task::none();
+        }
+        let port = self.edit_port.trim().parse().unwrap_or(1621);
+        let sync_tx = self.clock_sync_tx.clone();
+        Task::perform(
+            async move { Self::read_via_worker(&sync_tx, &ip, port).await },
+            Message::NamesLoaded,
+        )
     }
 
     /// 把人員寫入委託給 clock-sync worker：worker 先釋放自己的 1621 session 再執行，
@@ -843,10 +919,10 @@ async fn read_via_worker(
             }
         };
 
-        let gcp_line = match &self.gcp_status {
-            Some((true, d)) => format!("GCP 送達成功：{d}"),
-            Some((false, d)) => format!("GCP 送達失敗：{d}"),
-            None => "尚未送出任何事件".to_string(),
+        let delivery_line = |label: &'static str| match self.delivery_status.get(label) {
+            Some((true, d)) => format!("{label} 送達成功：{d}"),
+            Some((false, d)) => format!("{label} 送達失敗：{d}"),
+            None => format!("{label}：尚未送出任何事件"),
         };
 
         let status = column![
@@ -854,12 +930,19 @@ async fn read_via_worker(
             text(format!("卡鐘 RTC：{}", self.clock_rtc)).size(13),
             text(format!("監聽：{}", self.listen_addr)).size(13),
             text(format!("已連線卡鐘：{connected}")).size(13),
-            text(gcp_line).size(13),
+            text(delivery_line("GCP")).size(13),
+            text(delivery_line("人資")).size(13),
         ]
         .spacing(4);
 
         let events = column![
-            text("最近刷卡").size(18),
+            row![
+                text("最近刷卡").size(18),
+                text("").width(Length::Fill),
+                button("重新整理姓名").on_press(Message::RefreshNames),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(8),
             text("（可用滑鼠選取後 Ctrl+C 複製卡號，再到「人員管理」貼上新增）").size(12),
             text_editor(&self.recent_text)
                 .on_action(Message::RecentAction)
@@ -945,7 +1028,7 @@ async fn read_via_worker(
         column![form, log_area].spacing(12).into()
     }
 
-    /// 設定頁：卡鐘與 GCP 設定
+    /// 設定頁：卡鐘與兩套後台設定
     fn settings_view(&self) -> Element<'_, Message, Theme, iced::Renderer> {
         let settings = column![
             text("卡鐘設定").size(18),
@@ -982,6 +1065,20 @@ async fn read_via_worker(
                 text_input("X-Api-Key 的值", &self.edit_api_key).on_input(Message::EditApiKey),
             ]
             .spacing(8),
+            text("人資系統").size(18),
+            row![
+                text("Endpoint "),
+                text_input("http://.../api/v1/punch-events", &self.edit_hr_endpoint)
+                    .on_input(Message::EditHrEndpoint)
+                    .width(Length::Fill),
+            ]
+            .spacing(8),
+            row![
+                text("API Key   "),
+                text_input("X-Api-Key 的值", &self.edit_hr_api_key)
+                    .on_input(Message::EditHrApiKey),
+            ]
+            .spacing(8),
             button("儲存設定（寫入 config.json）").on_press(Message::Save),
         ]
         .spacing(8);
@@ -1001,6 +1098,15 @@ async fn read_via_worker(
 // Helpers used by async Tasks
 // ---------------------------------------------------------------------------
 
+/// 監控頁單筆刷卡文字：有姓名時 `時間  姓名 (UID)  事件  來自 IP`。
+fn format_event(name: Option<&str>, time: &str, uid: &str, event: &str, ip: &str) -> String {
+    match name {
+        Some(n) => format!("{time}  {n} ({uid})  {event}  來自 {ip}"),
+        None => format!("{time}  {uid}  {event}  來自 {ip}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn save_config(
     external: Arc<tokio::sync::RwLock<Config>>,
     cfg_path: Option<PathBuf>,
@@ -1008,6 +1114,8 @@ async fn save_config(
     port: String,
     endpoint: String,
     api_key: String,
+    hr_endpoint: String,
+    hr_api_key: String,
 ) -> Result<(), String> {
     let mut cfg = external.write().await;
 
@@ -1026,6 +1134,17 @@ async fn save_config(
         Some(api_key.clone())
     };
     cfg.gcp.api_key_header = Some("X-Api-Key".to_string());
+    cfg.hr.endpoint_url = if hr_endpoint.is_empty() {
+        None
+    } else {
+        Some(hr_endpoint.clone())
+    };
+    cfg.hr.api_key_value = if hr_api_key.is_empty() {
+        None
+    } else {
+        Some(hr_api_key.clone())
+    };
+    cfg.hr.api_key_header = Some("X-Api-Key".to_string());
     drop(cfg);
 
     // persist to disk
@@ -1058,6 +1177,27 @@ async fn test_tcp(ip: String, port: u16) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Event line formatting
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod event_format_tests {
+    use super::format_event;
+
+    #[test]
+    fn shows_name_when_known_and_uid_when_not() {
+        assert_eq!(
+            format_event(Some("王小明"), "2026-11-08 08:01:23", "00000000FD6374F6", "M11", "192.168.1.127"),
+            "2026-11-08 08:01:23  王小明 (00000000FD6374F6)  M11  來自 192.168.1.127"
+        );
+        assert_eq!(
+            format_event(None, "2026-11-08 08:01:23", "00000000FD6374F6", "M11", "192.168.1.127"),
+            "2026-11-08 08:01:23  00000000FD6374F6  M11  來自 192.168.1.127"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CJK font regression guard
 // ---------------------------------------------------------------------------
 //
@@ -1072,7 +1212,7 @@ mod ui_font_tests {
     use iced_graphics::text::cosmic_text;
 
     const CJK_SAMPLE: &str =
-        "打卡機中轉程式等待卡鐘連線轉拋儲存設定已連線離線最近刷卡命令埠測試錯誤GCP送達成功尚無本機位址填入後台";
+        "打卡機中轉程式等待卡鐘連線轉拋儲存設定已連線離線最近刷卡命令埠測試錯誤GCP送達成功尚無本機位址填入後台人資系統重新整理姓名載入個回讀失敗不影響";
 
     fn face_covers_all(face: &ttf_parser::Face) -> bool {
         CJK_SAMPLE.chars().all(|c| face.glyph_index(c).is_some())

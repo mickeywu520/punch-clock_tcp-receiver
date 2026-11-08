@@ -363,11 +363,22 @@ TCP line ─▶ parser ─▶ PunchEvent ─┬─▶ iced UI 狀態面板（來
     "batch_enabled": false,
     "batch_max_items": 100,
     "batch_flush_interval_secs": 5
+  },
+  "hr": {
+    "endpoint_url": "http://127.0.0.1:3000/api/v1/punch-events",
+    "bearer_token": "",
+    "api_key_header": "X-Api-Key",
+    "api_key_value": "",
+    "timeout_secs": 10,
+    "retry_attempts": 5,
+    "batch_enabled": false,
+    "batch_max_items": 100,
+    "batch_flush_interval_secs": 5
   }
 }
 ```
 
-環境變數覆寫：`PUNCH_BIND`、`PUNCH_PORT`、`PUNCH_UI_ENABLED`（`0` 關閉 GUI，等同 `--headless`）、`PUNCH_GCP_URL`、`PUNCH_GCP_TOKEN`、`PUNCH_GCP_API_KEY`、`PUNCH_GCP_API_KEY_HEADER`、`PUNCH_RECEIVER_ID`。（Token/Key 之值勿進 git，用 `.env` / Secret Manager。）
+環境變數覆寫：`PUNCH_BIND`、`PUNCH_PORT`、`PUNCH_UI_ENABLED`（`0` 關閉 GUI，等同 `--headless`）、`PUNCH_GCP_URL`、`PUNCH_GCP_TOKEN`、`PUNCH_GCP_API_KEY`、`PUNCH_GCP_API_KEY_HEADER`、`PUNCH_HR_URL`、`PUNCH_HR_TOKEN`、`PUNCH_HR_API_KEY`、`PUNCH_HR_API_KEY_HEADER`、`PUNCH_RECEIVER_ID`。（Token/Key 之值勿進 git，用 `.env` / Secret Manager。）
 
 ---
 

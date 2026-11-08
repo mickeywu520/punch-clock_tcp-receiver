@@ -53,6 +53,10 @@ Copy-Item config.example.json config.json   # PowerShell
 | `gcp.bearer_token` | `PUNCH_GCP_TOKEN` | 無 | `Authorization: Bearer` |
 | `gcp.api_key_value` | `PUNCH_GCP_API_KEY` | 無 | header 驗證（後台 `PUNCH_API_KEY`） |
 | `gcp.api_key_header` | `PUNCH_GCP_API_KEY_HEADER` | `X-Api-Key` | header 名稱 |
+| `hr.endpoint_url` | `PUNCH_HR_URL` | 無 | 人資後台收件 URL（同一批事件，第二個目的地） |
+| `hr.bearer_token` | `PUNCH_HR_TOKEN` | 無 | `Authorization: Bearer` |
+| `hr.api_key_value` | `PUNCH_HR_API_KEY` | 無 | header 驗證（人資後台 `PUNCH_API_KEY`） |
+| `hr.api_key_header` | `PUNCH_HR_API_KEY_HEADER` | `X-Api-Key` | header 名稱 |
 | `receiver_id` | `PUNCH_RECEIVER_ID` | `punch-clock-01` | 實例識別 |
 | `spool_dir` | - | `./spool` | 送達失敗暫存目錄（JSONL） |
 
@@ -264,7 +268,7 @@ python tools/punch_admin.py del-user --host 192.168.1.127 --port 1621 \
 | `ingested_by.receiver_id` | string | 是 | 接收端實例名稱 |
 | `raw_message` | string | 是 | 原始接收行（保留稽核） |
 
-> 後台解析必須**容忍缺欄位**（上表必填外皆可缺，不視為錯誤）。後端也可接受「僅 `event_id`、`occurred_at`、`card`」三個必填；`card` 至少一種：`card_number_hi+lo`（優先）、或 `uid_hex`、或 `uid_decimal`。
+> 後台解析必須**容忍缺欄位**（上表必填外皆可缺，不視為錯誤）。本系統後端（禾笙 HR v1.9）**只認 `card.uid_hex`**（缺時以 `uid_decimal` 換算），`card_number_hi+lo` / `site_code` / `card_code` 一律忽略。
 
 ### 7.3 傳輸與認證
 
@@ -306,8 +310,8 @@ python tools/punch_admin.py del-user --host 192.168.1.127 --port 1621 \
 - **冪等**：以 `event_id`（UUID v4）為唯一鍵；重試／spool 重送沿用同一 id → 後台回 `duplicate` 不重複入帳計次。
 - **重試**：5xx／429／timeout → 指數退避（`retry_attempts`，預設 5）。
 - **永久失敗**：4xx（非 429）不重試（回原 retry 錯誤）。
-- **最終失敗**：落 `spool/*.jsonl`（含原 `event_id`），啟動時最佳努力 replay。
-- **未設 `gcp.endpoint_url`**：只落 `spool/` 不送出。
+- **最終失敗**：落 `spool/*.jsonl`（GCP）或 `spool/hr/*.jsonl`（人資），含原 `event_id`；啟動時最佳努力 replay。
+- **未設 `gcp.endpoint_url` 或 `hr.endpoint_url`**：該目的地不送；兩邊都沒設時只落 `spool/`。
 - **批次**：`batch_enabled=true` 時，單筆 buffer 達 `batch_max_items` 或間隔 `batch_flush_interval_secs` flush；後台單筆／批次皆收。
 
 ---
