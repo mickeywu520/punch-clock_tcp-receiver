@@ -246,6 +246,11 @@ pub fn run(flags: Flags) -> iced::Result {
         .title("打卡機中轉程式 (Punch Clock Receiver)")
         .subscription(App::subscription)
         .theme(Theme::Dark)
+        // 視窗標題列／工作列圖示沿用 tray 圖示，避免左上角出現 iced 預設圖示。
+        .window(window::Settings {
+            icon: window::icon::from_rgba(tray::icon_rgba(), tray::ICON_SIZE, tray::ICON_SIZE).ok(),
+            ..Default::default()
+        })
         // 方案 A：不讓 X 直接關閉程式，改由 `window::Event::CloseRequested`
         // 收進工作匣（tray）；真正離開走 tray 選單「離開程式」→ `window::close`
         .exit_on_close_request(false)

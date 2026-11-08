@@ -48,7 +48,7 @@ pub fn build_tray() -> Result<TrayHandle, String> {
     menu.append_items(&[&show, &quit])
         .map_err(|e| format!("建立 tray 選單失敗：{e}"))?;
 
-    let icon = tray_icon::Icon::from_rgba(tray_icon_bytes(), 32, 32)
+    let icon = tray_icon::Icon::from_rgba(icon_rgba(), ICON_SIZE, ICON_SIZE)
         .map_err(|e| format!("建立 tray 圖示失敗：{e:?}"))?;
 
     tray_icon::TrayIconBuilder::new()
@@ -66,9 +66,11 @@ pub fn build_tray() -> Result<TrayHandle, String> {
 
 /// 程式碼內建的 32x32 時鐘圖示（RGBA）。原本用白色，在淺色工作列上會「隱形」，
 /// 改為深藍（IKB/DeepBlue，RGB 0,70,153）：淺色與深色工作列都能清楚看見。
-#[cfg(target_os = "windows")]
-fn tray_icon_bytes() -> Vec<u8> {
-    const SIZE: usize = 32;
+/// tray 與視窗標題列共用同一份像素。
+pub const ICON_SIZE: u32 = 32;
+
+pub fn icon_rgba() -> Vec<u8> {
+    const SIZE: usize = ICON_SIZE as usize;
     const CX: i32 = 15;
     const CY: i32 = 16;
     const R: i32 = 12;
@@ -96,7 +98,6 @@ fn tray_icon_bytes() -> Vec<u8> {
 }
 
 /// 檢查 (dx, dy) 是否落在從原點往角度 `angle` 長度 `len` 的粗線段上。
-#[cfg(target_os = "windows")]
 fn line_hit(dx: i32, dy: i32, angle: f64, len: f64) -> bool {
     let rad = angle.to_radians();
     let ex = (len * rad.cos()).round() as i32;
@@ -118,12 +119,15 @@ fn line_hit(dx: i32, dy: i32, angle: f64, len: f64) -> bool {
     d2 <= 2.0
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     #[test]
-    fn tray_icon_bytes_valid_rgba() {
-        let rgba = super::tray_icon_bytes();
-        assert_eq!(rgba.len(), 32 * 32 * 4);
+    fn icon_rgba_valid() {
+        let rgba = super::icon_rgba();
+        assert_eq!(
+            rgba.len(),
+            (super::ICON_SIZE * super::ICON_SIZE * 4) as usize
+        );
         assert!(rgba.iter().any(|&b| b != 0), "icon 不應全透明");
     }
 }
