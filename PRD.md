@@ -13,6 +13,7 @@
 | v1.4 | 2026-09-19 | **中介程式 + iced UI（顯示本機 IP／狀態面板）新增**：<br>① §2.2 補「現場設定流程」（後台 `Message Server IP 1st` 預設 `0.0.0.0`、`Port 1st` 預設 `0`＝關閉；填上 receiver 的 IP + 8031 儲存後，**每次刷卡即自動推送**，不需其他設定）；<br>② §3 新增 FR-10（iced UI 大字顯示本機 IPv4，供施工人員照抄填入後台）、FR-11（UI 狀態面板：監聽／連線裝置／最近事件／GCP 上送）、FR-12（`--headless` 無 GUI 環境可用），§3.1 補部署彈性；<br>③ §4 系統流程補 UI 顯示分支；<br>④ §6 設定新增 `ui.enabled`（`PUNCH_UI_ENABLED`）；<br>⑤ §8 驗收補 GUI 施工流程項。 |
 | v1.5 | 2026-09-25 | **Free Access 通行模式與事件登錄實測補充**：<br>① 新增加 §2.9——卡片在 User List 但通行時區禁用時，刷卡**不建立事件**；以 TCP 指令埠 `20H`（Set）/`12H`（Get）sub-code `19H` 啟用並確認 Free Access；啟用後每次刷卡記錄為 **M03 Invalid card 但含完整卡 UID**；<br>② 記錄事件佇列**單一來源**（後台 Event Log／µA `25H`／8031 推播同一佇列），與 8031 推播僅在重開機／開機時出現之實測（§2.2「每次刷卡即自動推送」於此機不符）→ 即時打卡改採 **25H/37H 主動拉取**之依據；<br>③ 修正 Access Mode 的 Get 指令為 **`12H`（控制器參數），非 `1BH`**。 |
 | v1.6 | 2026-09-25 | **中轉程式完善（去重／語意化別名／事件碼修正／重連 forward 修正）**：<br>① 新增 **push/pull 跨通道去重**（`src/dedup.rs`，以 `occurred_at+UID+event_code` 為鍵、10 分鐘滑動視窗）——8031 推播與 25H/37H 拉取源自同一事件佇列（§2.9），重開機時兩通道可能各轉送同一筆而生不同 `event_id`，改由中轉端去重；<br>② 送出 §5.2 預留之語意化別名：`device.port_number`（＝`source_sub_code`）、`card.site_code`（＝`card_number_hi`）、`card.card_code`（＝`card_number_lo`）——後台版 PRD §7 選用增強交付；<br>③ **修正 `src/function_codes.rs` 30~34 位移錯誤**（附錄 A 已知落差）：30=Anti-pass back、31/32=副讀卡機離線/連線、33/34=用戶修改密碼/失敗；<br>④ 修正重連邏輯：非首次連線一律 forward 離線期間累積事件（原先 `first_session && forward_initial` 使**每次重連都靜默 37H 刪除事件**，與註解「later sessions forward」相反，造成後台 Event Log 有 M11 但 receiver 收不到）；25H 讀取錯誤改為連線層錯誤即拆 session 重連、僅 timeout 保留 session。 |
+| v1.7 | 2026-11-08 | **人資第二目的地、卡鐘姓名、圖示同步與本機 IP 過濾**：<br>① 新增 `hr` 設定區塊（`PUNCH_HR_*` 環境變數），每筆事件同時送 GCP 與人資後台；兩邊各自 spool（`spool/`、`spool/hr/`）與重試，單邊失敗不影響另一邊；<br>② 監控頁「最近刷卡」姓名改讀卡鐘 `2EH` User Alias（人員名稱以卡鐘為主，不以 HR 卡號對應姓名為準）；<br>③ 視窗標題列圖示沿用工作匣的時鐘圖示；<br>④ FR-10 本機 IPv4 只列**與卡鐘同網段**的位址，排除 WSL／Hyper-V 等虛擬網卡；<br>⑤ 版本 `0.0.3`，操作手冊同步更新。 |
 
 ---
 
@@ -277,7 +278,7 @@ SOYAL 網路型控制器本身提供 **Message Server** 主動推播功能：在
 | FR-7 | 結構化日誌（tracing），可設 log level；含 device IP、Node ID、event code。 | log 輸出 |
 | FR-8 | 設定採 `config.json` + 環境變數覆寫，支援 Container 部署。 | 設定檔範例 |
 | FR-9 | 優雅關閉（SIGINT/SIGTERM），關閉前 flush 未送佇列。 | Ctrl-C 測試 |
-| FR-10 | **UI 顯示本機 IP（iced）**：啟動時列舉本機所有 IPv4 位址（自動挑選「對外連線」IP 優先），大字顯示 `IP : 8031`，供施工人員照抄填入打卡機後台 `Message Server IP 1st` / `Message Port 1st`。 | 實機：依 UI 顯示填入後台後，打卡機能成功連線推送事件 |
+| FR-10 | **UI 顯示本機 IP（iced）**：啟動時列出本機 IPv4，**只顯示與卡鐘同網段**的位址（排除 WSL／Hyper-V 等虛擬網卡；卡鐘 IP 未設定時才列出全部），大字顯示 `IP : 8031`，供施工人員照抄填入打卡機後台 `Message Server IP 1st` / `Message Port 1st`。 | 實機：依 UI 顯示填入後台後，打卡機能成功連線推送事件 |
 | FR-11 | **UI 狀態面板**：顯示監聽埠 bind 狀態、已連線之打卡機（來源 IP／Node ID）、最近收到的事件摘要、GCP 上送狀態（成功／重試中／spool 待補送筆數）。 | 刷卡後 UI 即時更新 |
 | FR-12 | 支援 **headless**（`--headless` 或 `PUNCH_UI_ENABLED=0`）：無顯示器環境（Docker／雲端）保持原 CLI 行為，UI 完全不啟動。 | Docker 冒煙測試無 GUI 正常運作 |
 

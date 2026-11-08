@@ -71,7 +71,7 @@ Copy-Item config.example.json config.json   # PowerShell
 - `Message Server IP 2nd` = （選填）備援
 - 儲存後，每次刷卡即自動推送一筆記錄。
 
-> **現場流程**：施工人員以 receiver 的 **iced UI** 查閱本機 IPv4（啟動時自動列舉、大字顯示 `IP : 8031`），填入後台 `Message Server IP 1st`、`Message Port 1st`＝`8031` 儲存即可。後台預設 `0.0.0.0`／`0`＝推播關閉。
+> **現場流程**：施工人員以 receiver 的 **iced UI** 查閱本機 IPv4（啟動時自動列舉，**只顯示與卡鐘同網段的位址**，WSL／Hyper-V 虛擬網卡會排除；大字顯示 `IP : 8031`），填入後台 `Message Server IP 1st`、`Message Port 1st`＝`8031` 儲存即可。後台預設 `0.0.0.0`／`0`＝推播關閉。
 >
 > ⚠️ **實測更正（AR-821EFv5／4V6）**：8031 文字推播僅在**重開機／開機**時出現，刷卡當下不會推送。即時打卡改以 **25H/37H 主動拉取**補足（見 `PRD.md` §2.9）；寫入／讀取人員走另一支 TCP 指令埠（實測 `1621`），不需 8033 雙向 hosting。
 >
