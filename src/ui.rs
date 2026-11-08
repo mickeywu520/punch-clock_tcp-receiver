@@ -10,7 +10,7 @@
 //! only pin the default font to the Traditional-Chinese face on Windows.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -74,18 +74,61 @@ impl UiBus {
 // Local IPv4 helpers
 // ---------------------------------------------------------------------------
 
-pub fn local_ipv4() -> Vec<String> {
+pub fn local_ipv4(clock_ip: &str) -> Vec<String> {
     let Ok(addrs) = if_addrs::get_if_addrs() else {
         return Vec::new();
     };
-    let mut ips: Vec<String> = addrs
+    let v4: Vec<(Ipv4Addr, Ipv4Addr)> = addrs
         .into_iter()
-        .filter(|a| !a.is_loopback() && a.ip().is_ipv4())
-        .map(|a| a.ip().to_string())
+        .filter_map(|a| match a.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
+                Some((v4.ip, v4.netmask))
+            }
+            _ => None,
+        })
         .collect();
+    same_subnet_ips(&v4, clock_ip.parse().ok())
+}
+
+/// 有與卡鐘同網段的位址就只留那些（卡鐘只連得到同網段）；
+/// 都沒有時全留，例如卡鐘 IP 未設定或跨路由。
+fn same_subnet_ips(addrs: &[(Ipv4Addr, Ipv4Addr)], clock_ip: Option<Ipv4Addr>) -> Vec<String> {
+    let same_subnet = |(ip, mask): &(Ipv4Addr, Ipv4Addr)| {
+        clock_ip
+            .is_some_and(|c| u32::from(c) & u32::from(*mask) == u32::from(*ip) & u32::from(*mask))
+    };
+    let matched: Vec<_> = addrs.iter().filter(|a| same_subnet(a)).collect();
+    let chosen = if matched.is_empty() {
+        addrs.iter().collect()
+    } else {
+        matched
+    };
+    let mut ips: Vec<String> = chosen.into_iter().map(|(ip, _)| ip.to_string()).collect();
     ips.sort();
     ips.dedup();
     ips
+}
+
+#[cfg(test)]
+mod local_ip_tests {
+    use super::same_subnet_ips;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn keeps_only_the_clock_subnet() {
+        let addrs = [
+            (Ipv4Addr::new(172, 21, 64, 1), Ipv4Addr::new(255, 255, 240, 0)),
+            (Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(255, 255, 255, 0)),
+        ];
+        assert_eq!(
+            same_subnet_ips(&addrs, Some(Ipv4Addr::new(192, 168, 1, 127))),
+            vec!["192.168.1.50"]
+        );
+        assert_eq!(
+            same_subnet_ips(&addrs, None),
+            vec!["172.21.64.1", "192.168.1.50"]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +323,7 @@ fn default_font() -> Font {
 
 impl App {
     fn new(flags: Flags) -> Self {
-        let local_ips = local_ipv4();
+        let local_ips = local_ipv4(&flags.initial.punch_clock_ip);
         let mut app = App {
             external: flags.config,
             cfg_path: flags.cfg_path,
@@ -460,7 +503,11 @@ impl App {
             }
             Message::SaveResult(res) => {
                 self.status_line = match res {
-                    Ok(()) => "已儲存，立即生效。".to_string(),
+                    Ok(()) => {
+                        // 卡鐘 IP 可能換網段，重算要顯示的本機 IP。
+                        self.local_ips = local_ipv4(&self.edit_punch_clock_ip);
+                        "已儲存，立即生效。".to_string()
+                    }
                     Err(e) => format!("儲存失敗：{e}"),
                 };
                 Task::none()
